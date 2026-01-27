@@ -1,6 +1,7 @@
+// Force Refresh for Tailwind v4
 export default {
   plugins: {
-    '@tailwindcss/postcss': {},
+    '@tailwindcss/postcss': {}, // Add the '@' symbol here
     'autoprefixer': {},
   },
 };
