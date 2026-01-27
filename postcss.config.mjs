@@ -1,7 +1,7 @@
-// Force Refresh for Tailwind v4
+// Final Cloud Handshake for Tailwind v4
 export default {
   plugins: {
-    '@tailwindcss/postcss': {}, // Add the '@' symbol here
+    '@tailwindcss/postcss': {}, 
     'autoprefixer': {},
   },
 };
