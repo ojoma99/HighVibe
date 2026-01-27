@@ -91,6 +91,66 @@ const PRESETS: Record<PresetId, HighVibePreset> = {
   }
 };
 
+export type AmbientId =
+  | "none"
+  | "wind"
+  | "rain"
+  | "ocean"
+  | "stream"
+  | "fire"
+  | "thunder"
+  | "birds"
+  | "forest"
+  | "jungle"
+  | "nightInsects"
+  | "singingBowl"
+  | "cave"
+  | "cafe"
+  | "temple";
+
+export interface HighVibeAmbient {
+  id: AmbientId;
+  label: string;
+}
+
+const AMBIENTS: HighVibeAmbient[] = [
+  { id: "none", label: "None" },
+  { id: "wind", label: "Wind" },
+  { id: "rain", label: "Rain" },
+  { id: "ocean", label: "Ocean" },
+  { id: "stream", label: "Stream" },
+  { id: "fire", label: "Fire" },
+  { id: "thunder", label: "Thunder" },
+  { id: "birds", label: "Birds" },
+  { id: "forest", label: "Deep Forest" },
+  { id: "jungle", label: "Jungle" },
+  { id: "nightInsects", label: "Night Insects" },
+  { id: "singingBowl", label: "Singing Bowl" },
+  { id: "cave", label: "Cave" },
+  { id: "cafe", label: "Café" },
+  { id: "temple", label: "Temple" }
+];
+
+const AMBIENT_CONFIG: Record<
+  Exclude<AmbientId, "none">,
+  { noise: "pink" | "white" | "brown"; filter: "lowpass" | "highpass"; freq: number; gain: number }
+> = {
+  wind: { noise: "brown", filter: "lowpass", freq: 700, gain: 0.22 },
+  rain: { noise: "pink", filter: "lowpass", freq: 5000, gain: 0.18 },
+  ocean: { noise: "pink", filter: "lowpass", freq: 2500, gain: 0.2 },
+  stream: { noise: "pink", filter: "lowpass", freq: 1800, gain: 0.18 },
+  fire: { noise: "pink", filter: "lowpass", freq: 1200, gain: 0.2 },
+  thunder: { noise: "brown", filter: "lowpass", freq: 280, gain: 0.14 },
+  birds: { noise: "white", filter: "highpass", freq: 3400, gain: 0.1 },
+  forest: { noise: "brown", filter: "lowpass", freq: 650, gain: 0.2 },
+  jungle: { noise: "pink", filter: "lowpass", freq: 4000, gain: 0.19 },
+  nightInsects: { noise: "pink", filter: "highpass", freq: 3800, gain: 0.1 },
+  singingBowl: { noise: "brown", filter: "lowpass", freq: 140, gain: 0.12 },
+  cave: { noise: "brown", filter: "lowpass", freq: 380, gain: 0.12 },
+  cafe: { noise: "pink", filter: "lowpass", freq: 3200, gain: 0.14 },
+  temple: { noise: "pink", filter: "lowpass", freq: 850, gain: 0.16 }
+};
+
 class HighVibeEngine {
   private tone: ToneModule;
   private leftOscillator: import("tone").Oscillator | null = null;
@@ -100,6 +160,12 @@ class HighVibeEngine {
   private volumeNode: import("tone").Volume | null = null;
   private pinkNoise: import("tone").Noise | null = null;
   private pinkGain: import("tone").Gain | null = null;
+  private ambientNoise: import("tone").Noise | null = null;
+  private ambientFilter: import("tone").Filter | null = null;
+  private ambientGain: import("tone").Gain | null = null;
+  private ambientUserGain: import("tone").Gain | null = null;
+  private currentAmbientId: AmbientId = "none";
+  private currentAmbientVolume = 0.6;
   private currentBaseFrequency = 432;
   private currentBeatFrequency = 14;
   private currentVolume = 0.6;
@@ -107,6 +173,37 @@ class HighVibeEngine {
 
   constructor(tone: ToneModule) {
     this.tone = tone;
+  }
+
+  private disposeAmbient() {
+    this.ambientNoise?.stop();
+    this.ambientNoise?.dispose();
+    this.ambientFilter?.dispose();
+    this.ambientGain?.dispose();
+    this.ambientUserGain?.dispose();
+    this.ambientNoise = null;
+    this.ambientFilter = null;
+    this.ambientGain = null;
+    this.ambientUserGain = null;
+  }
+
+  setAmbient(id: AmbientId) {
+    this.ensureNodes();
+    this.disposeAmbient();
+    this.currentAmbientId = id;
+    if (id === "none" || !this.volumeNode) return;
+    const cfg = AMBIENT_CONFIG[id as Exclude<AmbientId, "none">];
+    const { Noise, Filter, Gain } = this.tone;
+    this.ambientUserGain = new Gain(this.currentAmbientVolume).connect(this.volumeNode);
+    this.ambientGain = new Gain(cfg.gain).connect(this.ambientUserGain);
+    this.ambientFilter = new Filter(cfg.freq, cfg.filter).connect(this.ambientGain);
+    this.ambientNoise = new Noise(cfg.noise).connect(this.ambientFilter);
+    this.ambientNoise.start();
+  }
+
+  setAmbientVolume(level: number) {
+    this.currentAmbientVolume = Math.max(0, Math.min(1, level));
+    if (this.ambientUserGain) this.ambientUserGain.gain.rampTo(this.currentAmbientVolume, 0.2);
   }
 
   private ensureNodes() {
@@ -183,12 +280,16 @@ class HighVibeEngine {
     if (this.pinkNoise && this.pinkNoise.state !== "started") {
       this.pinkNoise.start();
     }
+    if (this.currentAmbientId !== "none" && this.ambientNoise && this.ambientNoise.state !== "started") {
+      this.ambientNoise.start();
+    }
   }
 
   stop() {
     this.leftOscillator?.stop();
     this.rightOscillator?.stop();
     this.pinkNoise?.stop();
+    this.ambientNoise?.stop();
   }
 
   setFrequencies(baseFrequency: number, beatFrequency: number) {
@@ -211,9 +312,8 @@ class HighVibeEngine {
     if (!this.volumeNode) return;
     const targetDb = -60;
     this.volumeNode.volume.rampTo(targetDb, durationSeconds);
-    if (this.pinkGain) {
-      this.pinkGain.gain.rampTo(0, durationSeconds);
-    }
+    if (this.pinkGain) this.pinkGain.gain.rampTo(0, durationSeconds);
+    if (this.ambientUserGain) this.ambientUserGain.gain.rampTo(0, durationSeconds);
 
     await new Promise<void>((resolve) =>
       setTimeout(resolve, durationSeconds * 1000)
@@ -223,6 +323,7 @@ class HighVibeEngine {
   }
 
   dispose() {
+    this.disposeAmbient();
     this.leftOscillator?.dispose();
     this.rightOscillator?.dispose();
     this.leftPanner?.dispose();
@@ -238,6 +339,8 @@ export function useHighVibe() {
   const [baseFrequency, setBaseFrequency] = useState(432);
   const [volume, setVolume] = useState(60); // 0–100 UI, mapped to 0–1 internally
   const [presetId, setPresetId] = useState<PresetId>("focus");
+  const [ambientId, setAmbientId] = useState<AmbientId>("none");
+  const [ambientVolume, setAmbientVolume] = useState(60); // 0–100 UI
 
   const toneRef = useRef<ToneModule | null>(null);
   const engineRef = useRef<HighVibeEngine | null>(null);
@@ -277,7 +380,9 @@ export function useHighVibe() {
 
     engine.setFrequencies(baseFrequency, beatFrequency);
     engine.setVolume(volume / 100);
-  }, [baseFrequency, beatFrequency, volume, ensureEngine]);
+    engine.setAmbient(ambientId);
+    engine.setAmbientVolume(ambientVolume / 100);
+  }, [baseFrequency, beatFrequency, volume, ambientId, ambientVolume, ensureEngine]);
 
   const togglePlay = useCallback(async () => {
     const engine = await ensureEngine();
@@ -306,13 +411,14 @@ export function useHighVibe() {
       engine.setFrequencies(baseFrequency, beatFrequency);
       engine.setVolume(volume / 100);
       engine.setPinkLevel(0.15);
+      engine.setAmbient(ambientId);
+      engine.setAmbientVolume(ambientVolume / 100);
       setIsPlaying(true);
 
       // MediaSession metadata
       if (typeof navigator !== "undefined" && "mediaSession" in navigator) {
         const preset = PRESETS[presetId];
         try {
-          // @ts-expect-error - MediaSession is not in all TS lib targets
           navigator.mediaSession.metadata = new MediaMetadata({
             title: `HighVibe - ${preset.label}`,
             artist: "Binaural Field",
@@ -323,7 +429,7 @@ export function useHighVibe() {
         }
       }
     }
-  }, [isPlaying, baseFrequency, beatFrequency, volume, ensureEngine, presetId]);
+  }, [isPlaying, baseFrequency, beatFrequency, volume, ambientId, ambientVolume, ensureEngine, presetId]);
 
   const setBreathIntensity = useCallback(
     async (intensity: number) => {
@@ -379,6 +485,11 @@ export function useHighVibe() {
     setPresetId,
     presets: PRESETS,
     beatFrequency,
+    ambientId,
+    setAmbientId,
+    ambients: AMBIENTS,
+    ambientVolume,
+    setAmbientVolume,
     togglePlay,
     setBreathIntensity,
     softLanding
