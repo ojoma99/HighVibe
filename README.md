@@ -26,3 +26,6 @@ HighVibe is a high-frequency, unbiased enlightenment experience for web and mobi
 
 4. Open `http://localhost:3000` in your browser.
 
+## App icon and favicon
+
+Place your HighVibe logo as `public/icon.png`. That file is used as the favicon, PWA icon, and Apple touch icon. A square image (e.g. 512×512) works best.

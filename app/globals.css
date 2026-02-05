@@ -1,1 +1,9 @@
 @import "tailwindcss";
+
+html {
+  background: radial-gradient(ellipse 120% 80% at 50% 0%, #1e1b4b 0%, #0f172a 40%, #020617 100%);
+}
+
+body {
+  background: transparent;
+}

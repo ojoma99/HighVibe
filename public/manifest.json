@@ -1,0 +1,24 @@
+{
+  "name": "HighVibe",
+  "short_name": "HighVibe",
+  "description": "High-frequency, unbiased enlightenment through sound and design.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0c1222",
+  "theme_color": "#8B5CF6",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -5,11 +5,12 @@ export const metadata: Metadata = {
   title: "HighVibe",
   description: "High-frequency, unbiased enlightenment through sound and design.",
   manifest: "/manifest.json",
-  appleWebApp: { capable: true, title: "HighVibe" }
+  appleWebApp: { capable: true, title: "HighVibe" },
+  icons: { icon: "/icon.png", apple: "/icon.png" }
 };
 
 export const viewport: Viewport = {
-  themeColor: "#7C3AED",
+  themeColor: "#8B5CF6",
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
@@ -24,7 +25,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full">
       <head>
-        <link rel="apple-touch-icon" href="/icon" />
+        <link rel="apple-touch-icon" href="/icon.png" />
       </head>
       <body
         className="h-full bg-background text-foreground antialiased font-sans"

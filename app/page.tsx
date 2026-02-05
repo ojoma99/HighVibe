@@ -1,7 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion, useAnimation } from "framer-motion";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Info, Play, Pause, Waves } from "lucide-react";
 import { useHighVibe } from "@/hooks/useHighVibe";
 
@@ -29,12 +29,18 @@ export default function Home() {
     presets,
     setPresetId,
     beatFrequency,
+    ambientId,
+    setAmbientId,
+    ambients,
+    ambientVolume,
+    setAmbientVolume,
     togglePlay,
     setBreathIntensity,
     softLanding
   } = useHighVibe();
 
   const bgControls = useAnimation();
+  const breatheControls = useAnimation();
   const [sessionStart, setSessionStart] = useState<number | null>(null);
   const [breathElapsedMs, setBreathElapsedMs] = useState(0);
   const [breathPhase, setBreathPhase] = useState<"inhale" | "exhale">("inhale");
@@ -47,6 +53,24 @@ export default function Home() {
   const [showMinutesOverlay, setShowMinutesOverlay] = useState(false);
   const [showCompletionBloom, setShowCompletionBloom] = useState(false);
   const [truthPresetId, setTruthPresetId] = useState<string | null>(null);
+
+  const [portalActive, setPortalActive] = useState(false);
+  const [portalFrequency, setPortalFrequency] = useState<285 | 417>(285);
+  const [portalVolumeFrequency, setPortalVolumeFrequency] = useState(60);
+  const [portalVolumeBass, setPortalVolumeBass] = useState(40);
+  const [portalVolumeAtmosphere, setPortalVolumeAtmosphere] = useState(50);
+
+  const portalAudioRef = useRef<{
+    ctx: AudioContext;
+    oscFrequency: OscillatorNode;
+    gainFrequency: GainNode;
+    oscBass40: OscillatorNode;
+    oscBass80: OscillatorNode;
+    oscBass120: OscillatorNode;
+    gainBass: GainNode;
+  } | null>(null);
+
+  const backgroundHumAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const breathActive = isPlaying && breathElapsedMs < 60000;
   const isDeepFlow = isPlaying && !breathActive;
@@ -95,13 +119,144 @@ export default function Home() {
     return Math.max(0, Math.min(1, timerRemainingMs / timerTotalMs));
   }, [isTimerRunning, timerRemainingMs, timerTotalMs]);
 
+  const ensurePortalAudio = useCallback(async () => {
+    if (typeof window === "undefined") return null;
+    if (portalAudioRef.current) return portalAudioRef.current;
+
+    const AudioCtx =
+      (window.AudioContext ||
+        // Fallback for older Safari
+        (window as any).webkitAudioContext) ?? window.AudioContext;
+
+    const ctx = new AudioCtx();
+
+    // Main frequency oscillator (285Hz or 417Hz)
+    const gainFrequency = ctx.createGain();
+    gainFrequency.gain.value = 0;
+    gainFrequency.connect(ctx.destination);
+
+    const oscFrequency = ctx.createOscillator();
+    oscFrequency.type = "sine";
+    oscFrequency.frequency.value = portalFrequency;
+    oscFrequency.connect(gainFrequency);
+
+    // Harmonic saturation bass: 40Hz, 80Hz, 120Hz
+    const gainBass = ctx.createGain();
+    gainBass.gain.value = 0;
+    gainBass.connect(ctx.destination);
+
+    const oscBass40 = ctx.createOscillator();
+    oscBass40.type = "sine";
+    oscBass40.frequency.value = 40;
+    oscBass40.connect(gainBass);
+
+    const oscBass80 = ctx.createOscillator();
+    oscBass80.type = "sine";
+    oscBass80.frequency.value = 80;
+    oscBass80.connect(gainBass);
+
+    const oscBass120 = ctx.createOscillator();
+    oscBass120.type = "sine";
+    oscBass120.frequency.value = 120;
+    oscBass120.connect(gainBass);
+
+    oscFrequency.start();
+    oscBass40.start();
+    oscBass80.start();
+    oscBass120.start();
+
+    const audio = {
+      ctx,
+      oscFrequency,
+      gainFrequency,
+      oscBass40,
+      oscBass80,
+      oscBass120,
+      gainBass
+    };
+    portalAudioRef.current = audio;
+    return audio;
+  }, [portalFrequency]);
+
+  const updatePortalGains = useCallback(
+    (volFrequency: number, volBass: number) => {
+      const audio = portalAudioRef.current;
+      if (!audio) return;
+      const ctx = audio.ctx;
+      const vFreq = Math.max(0, Math.min(1, volFrequency / 100));
+      const vBass = Math.max(0, Math.min(1, volBass / 100));
+
+      audio.gainFrequency.gain.setTargetAtTime(vFreq, ctx.currentTime, 0.2);
+      audio.gainBass.gain.setTargetAtTime(vBass, ctx.currentTime, 0.2);
+    },
+    []
+  );
+
+
+  const updateAtmosphereVolume = useCallback((vol: number) => {
+    const audio = backgroundHumAudioRef.current;
+    if (!audio) return;
+    const v = Math.max(0, Math.min(1, vol / 100));
+    audio.volume = v;
+  }, []);
+
+  const togglePortal = useCallback(async () => {
+    if (portalActive) {
+      const audio = portalAudioRef.current;
+      if (audio) {
+        const { ctx, oscFrequency, oscBass40, oscBass80, oscBass120, gainFrequency, gainBass } = audio;
+        gainFrequency.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
+        gainBass.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
+        window.setTimeout(() => {
+          try {
+            oscFrequency.stop();
+            oscBass40.stop();
+            oscBass80.stop();
+            oscBass120.stop();
+          } catch {
+            // already stopped
+          }
+          ctx.close();
+          portalAudioRef.current = null;
+        }, 220);
+      }
+      const bgAudio = backgroundHumAudioRef.current;
+      if (bgAudio) {
+        bgAudio.pause();
+        bgAudio.currentTime = 0;
+      }
+      setPortalActive(false);
+    } else {
+      const audio = await ensurePortalAudio();
+      if (audio) {
+        updatePortalGains(portalVolumeFrequency, portalVolumeBass);
+        updateAtmosphereVolume(portalVolumeAtmosphere);
+        
+        // Start nature hum audio
+        if (!backgroundHumAudioRef.current) {
+          const bgAudio = new Audio("/nature-hum.mp3");
+          bgAudio.loop = true;
+          bgAudio.volume = portalVolumeAtmosphere / 100;
+          backgroundHumAudioRef.current = bgAudio;
+        }
+        try {
+          await backgroundHumAudioRef.current.play();
+        } catch (err) {
+          console.warn("Could not play nature hum:", err);
+        }
+        
+        setPortalActive(true);
+      }
+    }
+  }, [portalActive, ensurePortalAudio, updatePortalGains, updateAtmosphereVolume, portalVolumeFrequency, portalVolumeBass, portalVolumeAtmosphere]);
+
   useEffect(() => {
     const visualRate = beatFrequency ? Math.max(0.6, 8 / beatFrequency) : 4;
 
     if (isPlaying) {
       bgControls.start({
-        opacity: [0.3, 0.8],
-        scale: [1, 1.04],
+        opacity: [0.5, 0.95],
+        scale: [1, 1.06],
         transition: {
           duration: visualRate,
           repeat: Infinity,
@@ -111,12 +266,46 @@ export default function Home() {
       });
     } else {
       bgControls.start({
-        opacity: 0.25,
+        opacity: 0.4,
         scale: 1,
         transition: { duration: 0.6, ease: "easeOut" }
       });
     }
   }, [isPlaying, beatFrequency, bgControls]);
+
+  // Animate 4-4-8 breathing circle when Manifestation Portal is active
+  useEffect(() => {
+    if (!portalActive) {
+      breatheControls.stop();
+      return;
+    }
+
+    breatheControls.start({
+      scale: [0.9, 1.08, 1.08, 0.9],
+      opacity: [0.5, 0.95, 0.95, 0.5],
+      transition: {
+        duration: 16, // 4s in, 4s hold, 8s exhale
+        repeat: Infinity,
+        ease: "easeInOut",
+        times: [0, 0.25, 0.5, 1]
+      }
+    });
+  }, [portalActive, breatheControls]);
+
+  useEffect(() => {
+    if (!portalActive) return;
+    updatePortalGains(portalVolumeFrequency, portalVolumeBass);
+    updateAtmosphereVolume(portalVolumeAtmosphere);
+  }, [portalActive, portalVolumeFrequency, portalVolumeBass, portalVolumeAtmosphere, updatePortalGains, updateAtmosphereVolume]);
+
+  // Update frequency when toggle changes
+  useEffect(() => {
+    if (!portalActive) return;
+    const audio = portalAudioRef.current;
+    if (audio) {
+      audio.oscFrequency.frequency.setTargetAtTime(portalFrequency, audio.ctx.currentTime, 0.3);
+    }
+  }, [portalFrequency, portalActive]);
 
   // Track session start for 60s breath window
   useEffect(() => {
@@ -253,7 +442,7 @@ export default function Home() {
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10">
       <motion.div
-        className="pointer-events-none absolute -inset-40 -z-10 rounded-full bg-gradient-to-br from-accent via-accent-soft to-transparent blur-3xl"
+        className="pointer-events-none absolute -inset-40 -z-10 rounded-full bg-gradient-to-br from-accent/90 via-accent-soft/80 to-accent/20 blur-3xl"
         animate={bgControls}
       />
 
@@ -261,7 +450,7 @@ export default function Home() {
         className="relative z-10 mx-auto flex w-full max-w-4xl flex-col gap-8 rounded-3xl border border-white/5 bg-black/50 p-6 shadow-[0_0_80px_rgba(15,23,42,0.9)] backdrop-blur-2xl sm:p-10"
         onClick={handleTapToShowMinutes}
       >
-        {/* Luminous Breath Pacer Aura + Ghost Timer Ring */}
+        {/* Luminous Breath Pacer Aura + Ghost Timer Ring — at top of screen */}
         <AnimatePresence>
           {breathActive && (
             <motion.div
@@ -273,7 +462,7 @@ export default function Home() {
               }}
               exit={{ opacity: 0, scale: 0.95 }}
               transition={{ duration: 5, ease: "easeInOut" }}
-              className="pointer-events-none absolute inset-0 -z-10 flex items-center justify-center"
+              className="pointer-events-none fixed left-1/2 top-12 z-0 -translate-x-1/2 sm:top-16"
             >
               <div className="relative flex items-center justify-center">
                 <div
@@ -478,11 +667,26 @@ export default function Home() {
                     Shift the base pitch of both channels together.
                   </p>
                 </div>
-                <div className="text-right text-[0.7rem] text-slate-300">
-                  <span className="font-semibold">
-                    {baseFrequency.toFixed(1)}
-                  </span>{" "}
-                  Hz
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={20}
+                    max={2000}
+                    step={0.1}
+                    value={baseFrequency}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (!Number.isNaN(v))
+                        setBaseFrequency(Math.max(20, Math.min(2000, v)));
+                    }}
+                    onBlur={(e) => {
+                      const v = Number(e.target.value);
+                      if (Number.isNaN(v) || v < 20 || v > 2000)
+                        setBaseFrequency(432);
+                    }}
+                    className="w-20 rounded-lg border border-white/15 bg-black/40 px-2 py-1.5 text-right text-sm font-semibold text-slate-100 outline-none focus:border-accent-soft/60 focus:ring-1 focus:ring-accent-soft/40 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                  />
+                  <span className="text-[0.7rem] text-slate-400">Hz</span>
                 </div>
               </div>
               <input
@@ -490,7 +694,7 @@ export default function Home() {
                 min={200}
                 max={600}
                 step={0.5}
-                value={baseFrequency}
+                value={Math.max(200, Math.min(600, baseFrequency))}
                 onChange={(e) => setBaseFrequency(Number(e.target.value))}
                 className="w-full accent-accent-soft"
               />
@@ -531,6 +735,217 @@ export default function Home() {
                 <span>Immersive</span>
               </div>
             </div>
+
+            <div className="space-y-3 rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div>
+                <div className="font-semibold tracking-[0.16em] uppercase text-slate-200">
+                  Background sound
+                </div>
+                <p className="mt-0.5 text-[0.7rem] text-slate-400">
+                  Layer a sound under the binaural field. Mix with the breath texture.
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {ambients.map((a) => (
+                  <button
+                    key={a.id}
+                    type="button"
+                    onClick={() => setAmbientId(a.id)}
+                    className={`rounded-xl border px-2.5 py-1.5 text-left text-[0.7rem] transition ${
+                      ambientId === a.id
+                        ? "border-accent-soft/70 bg-white/10 text-slate-100"
+                        : "border-white/10 bg-white/3 text-slate-300 hover:border-accent-soft/50 hover:bg-white/6"
+                    }`}
+                  >
+                    {a.label}
+                  </button>
+                ))}
+              </div>
+              {ambientId !== "none" && (
+                <div className="mt-3 space-y-1.5 border-t border-white/5 pt-3">
+                  <div className="flex items-center justify-between text-[0.7rem] text-slate-400">
+                    <span>Background level</span>
+                    <span>{ambientVolume}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={ambientVolume}
+                    onChange={(e) => setAmbientVolume(Number(e.target.value))}
+                    className="w-full accent-accent-soft"
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* Instant Elevation */}
+        <section className={`mt-4 rounded-2xl border p-4 sm:p-5 ${
+          portalFrequency === 285
+            ? "border-emerald-500/30 bg-emerald-950/20"
+            : "border-purple-500/30 bg-purple-950/20"
+        }`}>
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-2">
+              <h2 className={`text-xs font-semibold uppercase tracking-[0.22em] ${
+                portalFrequency === 285 ? "text-emerald-300" : "text-purple-300"
+              }`}>
+                Instant Elevation
+              </h2>
+              <p className={`max-w-md text-[0.75rem] ${
+                portalFrequency === 285 ? "text-emerald-100/80" : "text-purple-100/80"
+              }`}>
+                {portalFrequency === 285
+                  ? "285 Hz · Instant Motivation. Close your eyes. Breathe into the vibration. Feel your energy rise."
+                  : "417 Hz · Clearing Negative Energy. Close your eyes. Breathe into the vibration. Release what no longer serves."}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={togglePortal}
+              className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                portalActive
+                  ? portalFrequency === 285
+                    ? "border-emerald-400 bg-emerald-500/20 text-emerald-100 shadow-[0_0_25px_rgba(34,197,94,0.5)]"
+                    : "border-purple-400 bg-purple-500/20 text-purple-100 shadow-[0_0_25px_rgba(168,85,247,0.5)]"
+                  : portalFrequency === 285
+                    ? "border-emerald-500/40 bg-black/40 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/10"
+                    : "border-purple-500/40 bg-black/40 text-purple-200 hover:border-purple-400 hover:bg-purple-500/10"
+              }`}
+            >
+              <span className={`h-2 w-2 rounded-full shadow-[0_0_10px_rgba(74,222,128,0.9)] ${
+                portalFrequency === 285 ? "bg-emerald-400" : "bg-purple-400"
+              }`} />
+              {portalActive ? "Elevation Active" : "Activate Elevation"}
+            </button>
+          </div>
+
+          {/* Frequency Toggle */}
+          <div className="mt-4 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => setPortalFrequency(285)}
+              className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                portalFrequency === 285
+                  ? "border-emerald-400 bg-emerald-500/20 text-emerald-100 shadow-[0_0_15px_rgba(34,197,94,0.4)]"
+                  : "border-emerald-500/30 bg-black/40 text-emerald-200/60 hover:border-emerald-400/50"
+              }`}
+            >
+              285 Hz · Instant Motivation
+            </button>
+            <button
+              type="button"
+              onClick={() => setPortalFrequency(417)}
+              className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                portalFrequency === 417
+                  ? "border-purple-400 bg-purple-500/20 text-purple-100 shadow-[0_0_15px_rgba(168,85,247,0.4)]"
+                  : "border-purple-500/30 bg-black/40 text-purple-200/60 hover:border-purple-400/50"
+              }`}
+            >
+              417 Hz · Clearing Energy
+            </button>
+          </div>
+
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 sm:items-center">
+            <div className="flex flex-col items-center justify-center gap-2">
+              <motion.div
+                className={`flex h-32 w-32 items-center justify-center rounded-full border shadow-[0_0_40px_rgba(34,197,94,0.4)] ${
+                  portalFrequency === 285
+                    ? "border-emerald-400/60 bg-emerald-500/10"
+                    : "border-purple-400/60 bg-purple-500/10 shadow-[0_0_40px_rgba(168,85,247,0.4)]"
+                }`}
+                animate={portalActive ? breatheControls : { scale: 1, opacity: 0.5 }}
+              >
+                <div className={`h-20 w-20 rounded-full bg-gradient-to-br ${
+                  portalFrequency === 285
+                    ? "from-emerald-400/70 via-teal-300/70 to-sky-400/60"
+                    : "from-purple-400/70 via-violet-300/70 to-indigo-400/60"
+                }`} />
+              </motion.div>
+              <p className={`text-[0.7rem] ${
+                portalFrequency === 285 ? "text-emerald-200/80" : "text-purple-200/80"
+              }`}>
+                4s In · 4s Hold · 8s Exhale
+              </p>
+              <p className={`mt-2 max-w-xs text-center text-[0.7rem] italic ${
+                portalFrequency === 285 ? "text-emerald-100/90" : "text-purple-100/90"
+              }`}>
+                {portalFrequency === 285
+                  ? "Close your eyes. Breathe into the 285Hz vibration. Feel your energy rise."
+                  : "Close your eyes. Breathe into the 417Hz vibration. Release what no longer serves."}
+              </p>
+            </div>
+
+            <div className="space-y-4 text-[0.75rem] text-slate-200">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className={`font-semibold ${
+                    portalFrequency === 285 ? "text-emerald-100" : "text-purple-100"
+                  }`}>
+                    {portalFrequency} Hz · Frequency Power
+                  </span>
+                  <span className="text-slate-300">{portalVolumeFrequency}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={portalVolumeFrequency}
+                  onChange={(e) => setPortalVolumeFrequency(Number(e.target.value))}
+                  className={`w-full ${
+                    portalFrequency === 285 ? "accent-emerald-400" : "accent-purple-400"
+                  }`}
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className={`font-semibold ${
+                    portalFrequency === 285 ? "text-emerald-100" : "text-purple-100"
+                  }`}>
+                    Harmonic Bass · 40/80/120 Hz
+                  </span>
+                  <span className="text-slate-300">{portalVolumeBass}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={portalVolumeBass}
+                  onChange={(e) => setPortalVolumeBass(Number(e.target.value))}
+                  className={`w-full ${
+                    portalFrequency === 285 ? "accent-emerald-400" : "accent-purple-400"
+                  }`}
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className={`font-semibold ${
+                    portalFrequency === 285 ? "text-emerald-100" : "text-purple-100"
+                  }`}>
+                    Atmosphere Volume
+                  </span>
+                  <span className="text-slate-300">{portalVolumeAtmosphere}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={portalVolumeAtmosphere}
+                  onChange={(e) => setPortalVolumeAtmosphere(Number(e.target.value))}
+                  className={`w-full ${
+                    portalFrequency === 285 ? "accent-emerald-400" : "accent-purple-400"
+                  }`}
+                />
+              </div>
+            </div>
           </div>
         </section>
 
@@ -560,6 +975,10 @@ export default function Home() {
             </div>
           </div>
         </section>
+
+        <footer className="mt-6 border-t border-white/5 pt-4 text-center text-[0.7rem] tracking-[0.2em] text-slate-500">
+          Created by Ojoma Abamu
+        </footer>
 
         {/* Breath guidance text overlay */}
         <AnimatePresence>

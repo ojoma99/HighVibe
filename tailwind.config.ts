@@ -9,15 +9,15 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        background: "#020817",
+        background: "#0c1222",
         foreground: "#E5F0FF",
         accent: {
-          DEFAULT: "#7C3AED",
-          soft: "#A855F7"
+          DEFAULT: "#8B5CF6",
+          soft: "#A78BFA"
         }
       },
       boxShadow: {
-        aura: "0 0 40px rgba(124,58,237,0.55)"
+        aura: "0 0 50px rgba(139,92,246,0.6)"
       }
     }
   },
