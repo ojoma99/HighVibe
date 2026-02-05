@@ -907,7 +907,7 @@ export default function Home() {
                   <span className={`font-semibold ${
                     portalFrequency === 285 ? "text-emerald-100" : "text-purple-100"
                   }`}>
-                    Harmonic Bass · 40/80/120 Hz
+                    Earth Vibration
                   </span>
                   <span className="text-slate-300">{portalVolumeBass}%</span>
                 </div>
@@ -929,7 +929,7 @@ export default function Home() {
                   <span className={`font-semibold ${
                     portalFrequency === 285 ? "text-emerald-100" : "text-purple-100"
                   }`}>
-                    Atmosphere Volume
+                    Nature Atmosphere
                   </span>
                   <span className="text-slate-300">{portalVolumeAtmosphere}%</span>
                 </div>
