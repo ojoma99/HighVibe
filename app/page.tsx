@@ -80,11 +80,15 @@ export default function Home() {
   const [bioSignalToNoise, setBioSignalToNoise] = useState<number | null>(null);
   const [bioLowLightWarning, setBioLowLightWarning] = useState(false);
   const [bioCameraMode, setBioCameraMode] = useState<"front" | "back">("front");
+  const [bioScanMode, setBioScanMode] = useState<"face" | "finger">("face");
   const [bioFlashEnabled, setBioFlashEnabled] = useState(false);
   const [bioAvailableCameras, setBioAvailableCameras] = useState<MediaDeviceInfo[]>([]);
   const [bioFingerLocked, setBioFingerLocked] = useState(false);
   const [bioFingerLockDuration, setBioFingerLockDuration] = useState(0);
   const [bioTimerPaused, setBioTimerPaused] = useState(false);
+  const [bioFocusQuality, setBioFocusQuality] = useState<number>(0); // 0-100, based on contrast
+  const [bioMotionOffset, setBioMotionOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [bioVibrationLevel, setBioVibrationLevel] = useState<number>(0); // 0-100, motion intensity
 
   const [portalActive, setPortalActive] = useState(false);
   const [portalFrequency, setPortalFrequency] = useState<285 | 417>(285);
@@ -122,6 +126,9 @@ export default function Home() {
   const bioLastHapticTimeRef = useRef<number>(0);
   const bioPauseStartTimeRef = useRef<number | null>(null);
   const bioTotalPausedTimeRef = useRef<number>(0);
+  const bioAnchorPointsRef = useRef<{ x: number; y: number }[]>([]); // 5 anchor points for motion tracking
+  const bioPrevImageDataRef = useRef<ImageData | null>(null); // Previous frame for optical flow
+  const bioMotionOffsetRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 }); // Cumulative motion offset
 
   // Advanced signal processing functions
   const applyMovingAverage = useCallback((signal: number[], windowSize: number): number[] => {
@@ -214,16 +221,182 @@ export default function Home() {
     };
   }, []);
 
-  const calculateROIAverage = useCallback((imageData: ImageData, roi: { x: number; y: number; width: number; height: number }): { r: number; g: number; b: number; brightness: number } => {
+  // Detect 5 high-contrast anchor points in center region for motion tracking
+  const detectAnchorPoints = useCallback((imageData: ImageData, width: number, height: number): { x: number; y: number }[] => {
+    const data = imageData.data;
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const searchRadius = Math.min(width, height) * 0.2; // Search in center 40% region
+    
+    // Calculate contrast (gradient magnitude) for each pixel
+    const contrastMap: { x: number; y: number; contrast: number }[] = [];
+    
+    for (let y = Math.max(1, centerY - searchRadius); y < Math.min(height - 1, centerY + searchRadius); y += 2) {
+      for (let x = Math.max(1, centerX - searchRadius); x < Math.min(width - 1, centerX + searchRadius); x += 2) {
+        const idx = (y * width + x) * 4;
+        const g = data[idx + 1]; // Green channel
+        
+        // Calculate gradient magnitude (Sobel-like)
+        const gx = Math.abs(
+          -data[((y - 1) * width + (x - 1)) * 4 + 1] +
+          data[((y - 1) * width + (x + 1)) * 4 + 1] +
+          -2 * data[(y * width + (x - 1)) * 4 + 1] +
+          2 * data[(y * width + (x + 1)) * 4 + 1] +
+          -data[((y + 1) * width + (x - 1)) * 4 + 1] +
+          data[((y + 1) * width + (x + 1)) * 4 + 1]
+        );
+        
+        const gy = Math.abs(
+          -data[((y - 1) * width + (x - 1)) * 4 + 1] +
+          -2 * data[((y - 1) * width + x) * 4 + 1] +
+          -data[((y - 1) * width + (x + 1)) * 4 + 1] +
+          data[((y + 1) * width + (x - 1)) * 4 + 1] +
+          2 * data[((y + 1) * width + x) * 4 + 1] +
+          data[((y + 1) * width + (x + 1)) * 4 + 1]
+        );
+        
+        const contrast = Math.sqrt(gx * gx + gy * gy);
+        contrastMap.push({ x, y, contrast });
+      }
+    }
+    
+    // Sort by contrast and pick top 5, ensuring they're spread out
+    contrastMap.sort((a, b) => b.contrast - a.contrast);
+    
+    const anchors: { x: number; y: number }[] = [];
+    const minDistance = searchRadius * 0.3; // Minimum distance between anchors
+    
+    for (const point of contrastMap) {
+      if (anchors.length >= 5) break;
+      
+      // Check if this point is far enough from existing anchors
+      const tooClose = anchors.some(anchor => {
+        const dx = point.x - anchor.x;
+        const dy = point.y - anchor.y;
+        return Math.sqrt(dx * dx + dy * dy) < minDistance;
+      });
+      
+      if (!tooClose) {
+        anchors.push({ x: point.x, y: point.y });
+      }
+    }
+    
+    // If we don't have 5 points, fill with evenly spaced points
+    while (anchors.length < 5) {
+      const angle = (anchors.length * 2 * Math.PI) / 5;
+      const radius = searchRadius * 0.5;
+      anchors.push({
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius
+      });
+    }
+    
+    return anchors.slice(0, 5);
+  }, []);
+
+  // Calculate optical flow (motion vector) for anchor points
+  const calculateOpticalFlow = useCallback((
+    prevImageData: ImageData,
+    currImageData: ImageData,
+    prevAnchors: { x: number; y: number }[]
+  ): { x: number; y: number; confidence: number } => {
+    const prevData = prevImageData.data;
+    const currData = currImageData.data;
+    const width = prevImageData.width;
+    const height = prevImageData.height;
+    
+    const searchRadius = 5; // Search radius for matching
+    const blockSize = 3; // Block size for template matching
+    
+    let totalDx = 0;
+    let totalDy = 0;
+    let validMatches = 0;
+    
+    for (const anchor of prevAnchors) {
+      const px = Math.floor(anchor.x);
+      const py = Math.floor(anchor.y);
+      
+      if (px < blockSize || px >= width - blockSize || py < blockSize || py >= height - blockSize) {
+        continue;
+      }
+      
+      // Extract template from previous frame (Green channel)
+      const template: number[] = [];
+      for (let dy = -blockSize; dy <= blockSize; dy++) {
+        for (let dx = -blockSize; dx <= blockSize; dx++) {
+          const idx = ((py + dy) * width + (px + dx)) * 4 + 1;
+          template.push(prevData[idx]);
+        }
+      }
+      
+      // Search for best match in current frame
+      let bestMatch = { dx: 0, dy: 0, score: Infinity };
+      
+      for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+        for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+          const nx = px + dx;
+          const ny = py + dy;
+          
+          if (nx < blockSize || nx >= width - blockSize || ny < blockSize || ny >= height - blockSize) {
+            continue;
+          }
+          
+          // Calculate sum of squared differences (SSD)
+          let ssd = 0;
+          let idx = 0;
+          for (let ty = -blockSize; ty <= blockSize; ty++) {
+            for (let tx = -blockSize; tx <= blockSize; tx++) {
+              const currIdx = ((ny + ty) * width + (nx + tx)) * 4 + 1;
+              const diff = currData[currIdx] - template[idx];
+              ssd += diff * diff;
+              idx++;
+            }
+          }
+          
+          if (ssd < bestMatch.score) {
+            bestMatch = { dx, dy, score: ssd };
+          }
+        }
+      }
+      
+      // Only use matches with reasonable confidence (low SSD)
+          if (bestMatch.score < 10000) { // Threshold for valid match
+            totalDx += bestMatch.dx;
+            totalDy += bestMatch.dy;
+            validMatches++;
+          }
+        }
+        
+        if (validMatches === 0) {
+          return { x: 0, y: 0, confidence: 0 };
+        }
+        
+        // Average motion across all anchor points
+        const avgDx = totalDx / validMatches;
+        const avgDy = totalDy / validMatches;
+        const confidence = validMatches / prevAnchors.length;
+        
+        return { x: avgDx, y: avgDy, confidence };
+      }, []);
+
+  const calculateROIAverage = useCallback((
+    imageData: ImageData,
+    roi: { x: number; y: number; width: number; height: number },
+    motionOffset?: { x: number; y: number }
+  ): { r: number; g: number; b: number; brightness: number } => {
     const data = imageData.data;
     const width = imageData.width;
     let rSum = 0, gSum = 0, bSum = 0;
     let pixelCount = 0;
     
-    const startX = Math.max(0, Math.floor(roi.x));
-    const endX = Math.min(width, Math.floor(roi.x + roi.width));
-    const startY = Math.max(0, Math.floor(roi.y));
-    const endY = Math.min(imageData.height, Math.floor(roi.y + roi.height));
+    // Apply motion compensation to ROI position
+    const compensatedX = roi.x + (motionOffset?.x || 0);
+    const compensatedY = roi.y + (motionOffset?.y || 0);
+    
+    const startX = Math.max(0, Math.floor(compensatedX));
+    const endX = Math.min(width, Math.floor(compensatedX + roi.width));
+    const startY = Math.max(0, Math.floor(compensatedY));
+    const endY = Math.min(imageData.height, Math.floor(compensatedY + roi.height));
     
     for (let y = startY; y < endY; y++) {
       for (let x = startX; x < endX; x++) {
@@ -334,6 +507,11 @@ export default function Home() {
     bioRGBHistoryRef.current = [];
     bioFilteredSignalRef.current = [];
     bioROIRef.current = null;
+    bioAnchorPointsRef.current = [];
+    bioPrevImageDataRef.current = null;
+    bioMotionOffsetRef.current = { x: 0, y: 0 };
+    setBioMotionOffset({ x: 0, y: 0 });
+    setBioVibrationLevel(0);
     bioLockStartTimeRef.current = null;
     if (bioAnimFrameRef.current != null) {
       cancelAnimationFrame(bioAnimFrameRef.current);
@@ -384,7 +562,7 @@ export default function Home() {
 
   // Toggle flash/torch
   const toggleFlash = useCallback(async () => {
-    if (!bioVideoTrackRef.current || bioCameraMode !== "back") return;
+    if (!bioVideoTrackRef.current || bioScanMode !== "finger") return;
     
     const newFlashState = !bioFlashEnabled;
     try {
@@ -396,42 +574,56 @@ export default function Home() {
       // Flash not supported on this device
       setBioFlashEnabled(false);
     }
-  }, [bioFlashEnabled, bioCameraMode]);
+  }, [bioFlashEnabled, bioScanMode]);
 
-  // Flip camera
-  const flipCamera = useCallback(async () => {
-    if (!isBioScanning) return;
+  // Switch scan mode (Face/Finger)
+  const switchScanMode = useCallback(async (newMode: "face" | "finger") => {
+    const wasScanning = isBioScanning;
     
-    const newMode = bioCameraMode === "front" ? "back" : "front";
-    setBioCameraMode(newMode);
+    // If scanning, stop the scan first for smooth transition
+    if (wasScanning) {
+      stopBioScan();
+    }
     
+    setBioScanMode(newMode);
+    setBioCameraMode(newMode === "finger" ? "back" : "front");
+    
+    // If not scanning, just update the mode (camera will be initialized on next scan start)
+    if (!wasScanning) {
+      return;
+    }
+    
+    // If was scanning, restart camera stream with new mode settings
     // Stop current stream
     if (bioStreamRef.current) {
       bioStreamRef.current.getTracks().forEach((track) => track.stop());
     }
     
-    // Turn off flash if switching away from back camera
-    if (bioCameraMode === "back" && bioFlashEnabled) {
+    // Turn off flash if switching away from finger mode
+    if (bioScanMode === "finger" && bioFlashEnabled) {
       setBioFlashEnabled(false);
     }
     
     try {
-      // Get new stream with different camera (Xiaomi 15t Pro optimized)
+      const isFingerMode = newMode === "finger";
+      // Get new stream with appropriate camera and settings
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: newMode === "back" ? { ideal: "environment" } : "user",
+          facingMode: isFingerMode ? { ideal: "environment" } : "user",
           width: { ideal: 640 },
           height: { ideal: 480 },
           // Frame rate stabilization: Lock to 30fps
           frameRate: { ideal: 30, min: 30, max: 30 },
           advanced: [
             { exposureMode: "manual" },
-            { focusMode: newMode === "back" ? "manual" : "continuous" },
-            { whiteBalanceMode: "auto" } // Will be set to manual after lock
+            { focusMode: "continuous" }, // Continuous focus for Bio-Scan
+            { whiteBalanceMode: "auto" }, // Will be set to manual after lock
+            // Macro Zoom: 2.0x zoom for Finger Scan
+            ...(isFingerMode ? [{ zoom: 2.0 }] : [])
           ] as any
         },
         audio: false
-      });
+      } as any);
       
       bioStreamRef.current = stream;
       const videoTrack = stream.getVideoTracks()[0];
@@ -445,16 +637,26 @@ export default function Home() {
         };
       }
       
-      // Auto-enable flash for back camera (finger PPG)
-      if (newMode === "back") {
+      // Auto-enable flash for Finger Scan mode
+      if (isFingerMode) {
         try {
-          // Lock focus at minimum distance (Macro) for back camera
+          // Apply continuous focus and flash for Finger Scan
           await (videoTrack as any).applyConstraints({
             advanced: [
               { torch: true },
-              { focusMode: "manual", focusDistance: 0 } // Macro focus
+              { focusMode: "continuous" } // Continuous focus for sharp image
             ]
           } as any);
+          
+          // Try to apply zoom
+          try {
+            await (videoTrack as any).applyConstraints({
+              zoom: 2.0
+            } as any);
+          } catch {
+            // Zoom not supported, CSS transform will handle it
+          }
+          
           setBioFlashEnabled(true);
         } catch {
           // Flash not supported
@@ -478,7 +680,13 @@ export default function Home() {
     } catch {
       setBioStatus("Unable to switch camera. Check permissions.");
     }
-  }, [isBioScanning, bioCameraMode, bioFlashEnabled]);
+  }, [isBioScanning, bioScanMode, bioFlashEnabled, stopBioScan]);
+
+  // Flip camera (legacy function - now uses scan mode)
+  const flipCamera = useCallback(async () => {
+    const newMode = bioScanMode === "face" ? "finger" : "face";
+    await switchScanMode(newMode);
+  }, [bioScanMode, switchScanMode]);
 
   const startBioScan = useCallback(async () => {
     if (typeof navigator === "undefined" || typeof window === "undefined") return;
@@ -488,10 +696,11 @@ export default function Home() {
     await enumerateCameras();
 
     try {
-      // Enhanced camera configuration optimized for Xiaomi 15t Pro
+      // Enhanced camera configuration based on scan mode
+      const isFingerMode = bioScanMode === "finger";
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: bioCameraMode === "back" ? { ideal: "environment" } : "user",
+          facingMode: isFingerMode ? { ideal: "environment" } : "user",
           width: { ideal: 640 },
           height: { ideal: 480 },
           // Frame rate stabilization: Lock to 30fps to prevent time-drift
@@ -499,13 +708,15 @@ export default function Home() {
           // Request exposure and focus lock to prevent hunting
           advanced: [
             { exposureMode: "manual" },
-            // Focus mode: continuous for front camera (rPPG), manual for back (PPG)
-            { focusMode: bioCameraMode === "back" ? "manual" : "continuous" },
-            { whiteBalanceMode: "auto" } // Will be set to manual after lock
+            // Focus mode: continuous for Bio-Scan to keep image sharp
+            { focusMode: "continuous" },
+            { whiteBalanceMode: "auto" }, // Will be set to manual after lock
+            // Macro Zoom: 2.0x zoom for Finger Scan to focus on fingertip
+            ...(isFingerMode ? [{ zoom: 2.0 }] : [])
           ] as any
         },
         audio: false
-      });
+      } as any);
       
       bioStreamRef.current = stream;
       const videoTrack = stream.getVideoTracks()[0];
@@ -516,33 +727,35 @@ export default function Home() {
         const capabilities = videoTrack.getCapabilities();
         const settings = videoTrack.getSettings();
         
-        // Try to lock exposure and focus
+        // Try to lock exposure and apply continuous focus for Bio-Scan
         if (videoTrack && "applyConstraints" in videoTrack) {
           try {
-            if (bioCameraMode === "back") {
-              // Back Camera PPG: Lock focus at minimum distance (Macro) to prevent focus hunting
-              await (videoTrack as any).applyConstraints({
-                advanced: [
-                  { exposureMode: "manual", exposureCompensation: 0 },
-                  { focusMode: "manual", focusDistance: 0 } // Minimum focal length for macro
-                ]
-              } as any);
-            } else {
-              // Front Camera rPPG: Use continuous focus
-              await (videoTrack as any).applyConstraints({
-                advanced: [
-                  { exposureMode: "manual", exposureCompensation: 0 },
-                  { focusMode: "continuous" }
-                ]
-              } as any);
+            const isFingerMode = bioScanMode === "finger";
+            // Apply continuous focus to keep image sharp during scan
+            await (videoTrack as any).applyConstraints({
+              advanced: [
+                { exposureMode: "manual", exposureCompensation: 0 },
+                { focusMode: "continuous" } // Continuous focus for sharp image
+              ]
+            } as any);
+            
+            // Try to apply zoom for Finger Scan mode
+            if (isFingerMode) {
+              try {
+                await (videoTrack as any).applyConstraints({
+                  zoom: 2.0
+                } as any);
+              } catch {
+                // Zoom not supported, will use CSS transform fallback
+              }
             }
           } catch {
             // Some devices don't support manual controls; continue anyway
           }
         }
         
-        // Auto-enable flash for back camera (finger PPG)
-        if (bioCameraMode === "back") {
+        // Auto-enable flash for Finger Scan mode
+        if (bioScanMode === "finger") {
           try {
             await (videoTrack as any).applyConstraints({
               advanced: [{ torch: true }]
@@ -594,13 +807,18 @@ export default function Home() {
       setBioFingerLocked(false);
       setBioFingerLockDuration(0);
       setBioTimerPaused(false);
-      setBioStatus(bioCameraMode === "back" ? "Place finger over lens..." : "Signal Acquisition: Stabilizing...");
+      setBioStatus(bioScanMode === "finger" ? "Place finger over lens..." : "Signal Acquisition: Stabilizing...");
       bioRGBHistoryRef.current = [];
       bioFilteredSignalRef.current = [];
       bioROIRef.current = null;
       bioLockStartTimeRef.current = null;
       bioPauseStartTimeRef.current = null;
       bioTotalPausedTimeRef.current = 0;
+      bioAnchorPointsRef.current = [];
+      bioPrevImageDataRef.current = null;
+      bioMotionOffsetRef.current = { x: 0, y: 0 };
+      setBioMotionOffset({ x: 0, y: 0 });
+      setBioVibrationLevel(0);
       
       const SIGNAL_ACQUISITION_MS = 15000; // 15 seconds as requested
       const SCAN_DURATION_MS = 60000;
@@ -614,8 +832,8 @@ export default function Home() {
         const remaining = Math.max(0, SCAN_DURATION_MS - elapsed);
         const acquisitionRemaining = Math.max(0, SIGNAL_ACQUISITION_MS - elapsed);
         
-        // For back camera, check finger lock before starting timer
-        if (bioCameraMode === "back") {
+        // For Finger Scan mode, check finger lock before starting timer
+        if (bioScanMode === "finger") {
           if (!bioFingerLocked || bioTimerPaused) {
             // Don't start timer until finger is locked for 2 seconds
             setBioScanRemaining(SCAN_DURATION_MS);
@@ -765,11 +983,55 @@ export default function Home() {
 
         const fullImageData = ctx.getImageData(0, 0, w, h);
         
+        // Motion compensation for Finger Scan mode
+        let motionOffset = { x: 0, y: 0 };
+        let vibrationLevel = 0;
+        
+        if (bioScanMode === "finger" && bioFingerLocked) {
+          // Detect anchor points on first lock or if not yet detected
+          if (bioAnchorPointsRef.current.length === 0) {
+            bioAnchorPointsRef.current = detectAnchorPoints(fullImageData, w, h);
+            bioPrevImageDataRef.current = fullImageData;
+            bioMotionOffsetRef.current = { x: 0, y: 0 };
+          } else if (bioPrevImageDataRef.current) {
+            // Calculate optical flow
+            const flow = calculateOpticalFlow(
+              bioPrevImageDataRef.current,
+              fullImageData,
+              bioAnchorPointsRef.current
+            );
+            
+            // Update cumulative motion offset
+            bioMotionOffsetRef.current.x += flow.x;
+            bioMotionOffsetRef.current.y += flow.y;
+            motionOffset = { ...bioMotionOffsetRef.current };
+            
+            // Calculate vibration level (magnitude of motion)
+            const motionMagnitude = Math.sqrt(flow.x * flow.x + flow.y * flow.y);
+            vibrationLevel = Math.min(100, (motionMagnitude / 5) * 100); // Normalize: 5px = 100%
+            setBioVibrationLevel(vibrationLevel);
+            
+            // Update anchor points position for next frame
+            bioAnchorPointsRef.current = bioAnchorPointsRef.current.map(anchor => ({
+              x: anchor.x + flow.x,
+              y: anchor.y + flow.y
+            }));
+            
+            // If motion is too high, show warning
+            if (motionMagnitude > 3) { // Threshold: 3 pixels per frame
+              setBioStatus("Vibration too high. Please keep steady for deep scan.");
+            }
+          }
+          
+          // Store current frame for next iteration
+          bioPrevImageDataRef.current = fullImageData;
+        }
+        
         // Different ROI detection based on camera mode
         let roi = bioROIRef.current;
         if (!roi) {
-          if (bioCameraMode === "back") {
-            // For back camera (finger PPG), use center region
+          if (bioScanMode === "finger") {
+            // For Finger Scan mode (finger PPG), use center region
             const centerX = w / 2;
             const centerY = h / 2;
             const roiSize = Math.min(w, h) * 0.4;
@@ -780,7 +1042,7 @@ export default function Home() {
               height: roiSize
             };
           } else {
-            // For front camera (face rPPG), use face ROI
+            // For Face Scan mode (face rPPG), use face ROI
             roi = detectFaceROI(fullImageData, w, h);
           }
           bioROIRef.current = roi;
@@ -791,11 +1053,43 @@ export default function Home() {
           return;
         }
 
-        // Extract RGB values from ROI
-        const rgb = calculateROIAverage(fullImageData, roi);
+        // Extract RGB values from ROI with motion compensation
+        const rgb = calculateROIAverage(fullImageData, roi, bioScanMode === "finger" ? motionOffset : undefined);
         
-        // For back camera (PPG), check finger alignment and lock state
-        if (bioCameraMode === "back") {
+        // Calculate focus quality based on image contrast (Laplacian variance)
+        const focusROI = {
+          x: Math.floor(roi.x),
+          y: Math.floor(roi.y),
+          width: Math.floor(roi.width),
+          height: Math.floor(roi.height)
+        };
+        const focusImageData = ctx.getImageData(focusROI.x, focusROI.y, focusROI.width, focusROI.height);
+        const focusData = focusImageData.data;
+        
+        // Calculate Laplacian variance (measure of sharpness)
+        let laplacianSum = 0;
+        let laplacianCount = 0;
+        for (let y = 1; y < focusROI.height - 1; y++) {
+          for (let x = 1; x < focusROI.width - 1; x++) {
+            const idx = (y * focusROI.width + x) * 4;
+            const center = focusData[idx + 1]; // Green channel
+            const top = focusData[((y - 1) * focusROI.width + x) * 4 + 1];
+            const bottom = focusData[((y + 1) * focusROI.width + x) * 4 + 1];
+            const left = focusData[(y * focusROI.width + (x - 1)) * 4 + 1];
+            const right = focusData[(y * focusROI.width + (x + 1)) * 4 + 1];
+            
+            const laplacian = Math.abs(4 * center - top - bottom - left - right);
+            laplacianSum += laplacian * laplacian;
+            laplacianCount++;
+          }
+        }
+        const laplacianVariance = laplacianCount > 0 ? laplacianSum / laplacianCount : 0;
+        // Normalize to 0-100 scale (threshold ~500 for good focus)
+        const focusQuality = Math.min(100, (laplacianVariance / 500) * 100);
+        setBioFocusQuality(focusQuality);
+        
+        // For Finger Scan mode, check finger alignment and lock state
+        if (bioScanMode === "finger") {
           // Calculate red channel intensity (0-1)
           const redIntensity = rgb.r;
           const redSaturation = rgb.r / (rgb.r + rgb.g + rgb.b + 0.001);
@@ -852,6 +1146,12 @@ export default function Home() {
             bioLockStartTimeRef.current = null;
             setBioFingerLocked(false);
             setBioFingerLockDuration(0);
+            // Reset motion tracking when finger is unlocked
+            bioAnchorPointsRef.current = [];
+            bioPrevImageDataRef.current = null;
+            bioMotionOffsetRef.current = { x: 0, y: 0 };
+            setBioMotionOffset({ x: 0, y: 0 });
+            setBioVibrationLevel(0);
             if (bioScanStartTimeRef.current && !bioPauseStartTimeRef.current) {
               // Start pause timer
               bioPauseStartTimeRef.current = Date.now();
@@ -870,8 +1170,8 @@ export default function Home() {
           }
         }
         
-        // Check for low light (only for front camera)
-        if (bioCameraMode === "front") {
+        // Check for low light (only for Face Scan mode)
+        if (bioScanMode === "face") {
           const isLowLight = rgb.brightness < 0.15;
           bioLowLightRef.current = isLowLight;
           setBioLowLightWarning(isLowLight);
@@ -891,15 +1191,15 @@ export default function Home() {
           bioRGBHistoryRef.current.shift();
         }
 
-        // Different signal extraction based on camera mode
+        // Different signal extraction based on scan mode
         let processedSignal: number[] = [];
         
-        if (bioCameraMode === "back") {
-          // Contact-PPG Mode: Use RED channel intensity shifts
-          const redValues = bioRGBHistoryRef.current.map((s) => s.r);
-          if (redValues.length > 1) {
-            // Detrend RED channel
-            processedSignal = detrendSignal(redValues);
+        if (bioScanMode === "finger") {
+          // Motion-Compensated Contact-PPG Mode: Use GREEN channel (most sensitive to blood volume)
+          const greenValues = bioRGBHistoryRef.current.map((s) => s.g);
+          if (greenValues.length > 1) {
+            // Detrend GREEN channel
+            processedSignal = detrendSignal(greenValues);
             
             // Estimate sample rate
             const sampleRate = bioRGBHistoryRef.current.length > 1 
@@ -909,11 +1209,11 @@ export default function Home() {
             // Bandpass filter
             processedSignal = butterworthBandpass(processedSignal, sampleRate, 0.7, 3.5);
             
-            // Moving average smoothing
+            // Moving average smoothing to remove noise from motion blur
             processedSignal = applyMovingAverage(processedSignal, 5);
           }
         } else {
-          // Front camera: Use CHROM algorithm
+          // Face Scan mode: Use CHROM algorithm
           const chromSignal = extractCHROM(bioRGBHistoryRef.current);
           
           if (chromSignal.length === 0) {
@@ -943,7 +1243,7 @@ export default function Home() {
         // Use the latest processed value as the pulse signal
         const avg = processedSignal.length > 0 
           ? processedSignal[processedSignal.length - 1] 
-          : (bioCameraMode === "back" ? rgb.r : rgb.g);
+          : (bioScanMode === "finger" ? rgb.g : rgb.g); // Green channel for both modes
         const elapsed = bioScanStartTimeRef.current ? Date.now() - bioScanStartTimeRef.current : 0;
         const SIGNAL_ACQUISITION_MS = 5000;
         const isAcquisitionPhase = elapsed < SIGNAL_ACQUISITION_MS;
@@ -2090,10 +2390,11 @@ export default function Home() {
                 Bio-Scan · HRV & Stress
               </h2>
               <p className="max-w-md text-[0.7rem] text-cyan-100/80">
-                Uses subtle color shifts (rPPG) to estimate nervous-system coherence. For a stronger signal,
-                gently rest a fingertip over the camera lens.
+                {bioScanMode === "face"
+                  ? "Uses subtle color shifts (rPPG) to estimate nervous-system coherence from facial blood flow."
+                  : "Place fingertip over camera lens for contact-PPG measurement with enhanced signal quality."}
               </p>
-              {bioCameraMode === "back" && (
+              {bioScanMode === "finger" && (
                 <p className="max-w-md text-[0.65rem] italic text-amber-200/70">
                   Optimal scan achieved via light touch; avoid pressing hard to keep the sensor cool.
                 </p>
@@ -2105,42 +2406,56 @@ export default function Home() {
             </div>
           </div>
 
+          {/* Mode Toggle */}
+          <div className="mt-4 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => void switchScanMode("face")}
+              className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                bioScanMode === "face"
+                  ? "border-cyan-400 bg-cyan-500/20 text-cyan-100 shadow-[0_0_15px_rgba(34,211,238,0.4)]"
+                  : "border-cyan-500/30 bg-black/40 text-cyan-200/60 hover:border-cyan-400/50"
+              }`}
+            >
+              Face Scan
+            </button>
+            <button
+              type="button"
+              onClick={() => void switchScanMode("finger")}
+              className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                bioScanMode === "finger"
+                  ? "border-cyan-400 bg-cyan-500/20 text-cyan-100 shadow-[0_0_15px_rgba(34,211,238,0.4)]"
+                  : "border-cyan-500/30 bg-black/40 text-cyan-200/60 hover:border-cyan-400/50"
+              }`}
+            >
+              Finger Scan
+            </button>
+          </div>
+
           <div className="mt-4 grid gap-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center">
             <div className="flex flex-col items-center gap-3">
               {/* Camera Controls */}
-              {isBioScanning && (
+              {isBioScanning && bioScanMode === "finger" && (
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => void flipCamera()}
-                    className="flex h-8 w-8 items-center justify-center rounded-full border border-cyan-400/40 bg-cyan-500/10 text-cyan-200/80 shadow-[0_0_10px_rgba(34,211,238,0.3)] transition hover:bg-cyan-500/20 hover:text-cyan-100"
-                    title="Flip Camera"
+                    onClick={() => void toggleFlash()}
+                    className={`flex h-8 w-8 items-center justify-center rounded-full border shadow-[0_0_10px_rgba(251,191,36,0.3)] transition ${
+                      bioFlashEnabled
+                        ? "border-amber-400/60 bg-amber-500/20 text-amber-200 shadow-[0_0_15px_rgba(251,191,36,0.6)]"
+                        : "border-amber-400/30 bg-amber-500/10 text-amber-200/60 hover:bg-amber-500/20"
+                    }`}
+                    title="Toggle Flash"
                   >
                     <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                     </svg>
                   </button>
-                  {bioCameraMode === "back" && (
-                    <button
-                      type="button"
-                      onClick={() => void toggleFlash()}
-                      className={`flex h-8 w-8 items-center justify-center rounded-full border shadow-[0_0_10px_rgba(251,191,36,0.3)] transition ${
-                        bioFlashEnabled
-                          ? "border-amber-400/60 bg-amber-500/20 text-amber-200 shadow-[0_0_15px_rgba(251,191,36,0.6)]"
-                          : "border-amber-400/30 bg-amber-500/10 text-amber-200/60 hover:bg-amber-500/20"
-                      }`}
-                      title="Toggle Flash"
-                    >
-                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                    </button>
-                  )}
                 </div>
               )}
               <div className="relative flex h-20 w-20 items-center justify-center">
-                {/* Finger Alignment Aura Circle (Back Camera Only) */}
-                {isBioScanning && bioCameraMode === "back" && (
+                {/* Finger Alignment Aura Circle (Finger Scan Only) */}
+                {isBioScanning && bioScanMode === "finger" && (
                   <motion.div
                     className="absolute inset-0 flex items-center justify-center"
                     initial={{ opacity: 0, scale: 0.8 }}
@@ -2316,10 +2631,25 @@ export default function Home() {
               
               <div className="text-[0.65rem] text-cyan-100/80 text-center">
                 {bioStatus ?? "Tap Bio-Scan to begin a short check-in."}
+                {isBioScanning && (
+                  <div className="mt-2 rounded-lg border border-cyan-400/50 bg-cyan-500/10 px-3 py-2 text-[0.65rem] text-cyan-200/90">
+                    Hold phone 6 inches away. Use the zoom circle to align.
+                  </div>
+                )}
                 {bioLowLightWarning && (
                   <div className="mt-2 rounded-lg border border-amber-400/50 bg-amber-500/10 px-3 py-2 text-[0.65rem] text-amber-200/90">
                     Move closer to a soft light source or use the 'Glow UI' to illuminate your face.
                   </div>
+                )}
+                {bioScanMode === "finger" && bioVibrationLevel > 60 && isBioScanning && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    className="mt-2 rounded-lg border border-red-400/50 bg-red-500/10 px-3 py-2 text-[0.65rem] text-red-200/90"
+                  >
+                    Vibration too high. Please keep steady for deep scan.
+                  </motion.div>
                 )}
               </div>
               
@@ -2355,15 +2685,43 @@ export default function Home() {
                   </motion.div>
                 )}
               </AnimatePresence>
-              <video
-                ref={bioVideoRef}
-                className={`h-32 w-32 rounded-xl border border-cyan-400/50 object-cover shadow-[0_0_30px_rgba(34,211,238,0.5)] transition-opacity ${
-                  isBioScanning ? "opacity-100" : "opacity-0 pointer-events-none"
-                }`}
-                playsInline
-                muted
-                autoPlay
-              />
+              <div className="relative">
+                {/* Focus Ring Indicator */}
+                {isBioScanning && (
+                  <div className={`absolute -inset-1 rounded-xl border-2 transition-all duration-300 ${
+                    bioFocusQuality > 60
+                      ? "border-emerald-400/80 shadow-[0_0_20px_rgba(34,197,94,0.6)]"
+                      : "border-amber-400/40 shadow-[0_0_15px_rgba(251,191,36,0.3)]"
+                  }`}>
+                    {bioFocusQuality > 60 && (
+                      <motion.div
+                        className="absolute -inset-0.5 rounded-xl border border-emerald-400/60"
+                        animate={{
+                          opacity: [0.6, 1, 0.6],
+                        }}
+                        transition={{
+                          duration: 2,
+                          repeat: Infinity,
+                          ease: "easeInOut"
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
+                <video
+                  ref={bioVideoRef}
+                  className={`h-32 w-32 rounded-xl border border-cyan-400/50 object-cover shadow-[0_0_30px_rgba(34,211,238,0.5)] transition-opacity ${
+                    isBioScanning ? "opacity-100" : "opacity-0 pointer-events-none"
+                  }`}
+                  style={{
+                    transform: bioScanMode === "finger" ? "scale(2.0)" : "scale(1.0)",
+                    transformOrigin: "center center"
+                  }}
+                  playsInline
+                  muted
+                  autoPlay
+                />
+              </div>
               <canvas ref={bioCanvasRef} className="hidden" />
             </div>
 
