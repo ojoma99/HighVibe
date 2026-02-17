@@ -1416,14 +1416,14 @@ export default function Home() {
   const resonance = getTodayResonance();
 
   return (
-    <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 py-10">
+    <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background px-4 pt-20 pb-10">
       <motion.div
         className="pointer-events-none absolute -inset-40 -z-10 rounded-full bg-gradient-to-br from-accent/90 via-accent-soft/80 to-accent/20 blur-3xl"
         animate={bgControls}
       />
 
       <div
-        className="relative z-10 mx-auto flex w-full max-w-4xl flex-col gap-8 rounded-3xl border border-white/5 bg-black/50 p-6 shadow-[0_0_80px_rgba(15,23,42,0.9)] backdrop-blur-2xl pb-24 sm:p-10 sm:pb-24"
+        className="relative z-10 mx-auto flex w-full max-w-4xl flex-col gap-8 rounded-3xl border border-white/5 bg-black/50 p-6 shadow-[0_0_80px_rgba(15,23,42,0.9)] backdrop-blur-2xl pt-24 sm:p-10 sm:pt-24"
         onClick={handleTapToShowMinutes}
       >
         <div className="min-h-[50vh]">
@@ -2484,8 +2484,8 @@ export default function Home() {
           </AnimatePresence>
         </div>
 
-        {/* Fixed bottom navigation */}
-        <nav className="fixed bottom-0 left-0 right-0 z-30 flex items-center justify-center border-t border-white/10 bg-slate-950/95 backdrop-blur-xl">
+        {/* Fixed top navigation */}
+        <nav className="fixed top-0 left-0 right-0 z-30 flex items-center justify-center border-b border-white/10 bg-slate-950/95 backdrop-blur-xl">
           <div className="flex w-full max-w-4xl items-center justify-around px-2 py-2">
             <button
               type="button"
