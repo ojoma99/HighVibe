@@ -345,6 +345,7 @@ export function useHighVibe() {
   const toneRef = useRef<ToneModule | null>(null);
   const engineRef = useRef<HighVibeEngine | null>(null);
   const silentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const awakeningSweepRef = useRef(false);
 
   const beatFrequency = PRESETS[presetId].beatFrequency;
 
@@ -451,6 +452,63 @@ export function useHighVibe() {
     [ensureEngine, isPlaying]
   );
 
+  const runAwakeningSweep = useCallback(async () => {
+    if (awakeningSweepRef.current) return;
+
+    const engine = await ensureEngine();
+    if (!engine) return;
+
+    awakeningSweepRef.current = true;
+
+    try {
+      if (!isPlaying) {
+        await togglePlay();
+      }
+
+      const startBeat = 8;
+      const endBeat = 40;
+      const sweepMs = 7000;
+      const sustainMs = 10000;
+      const stepMs = 100;
+
+      const initialBeat = PRESETS[presetId].beatFrequency;
+      const initialVolume = volume;
+      const volumeBoost = Math.min(10, 100 - initialVolume);
+
+      const startTime = performance.now();
+
+      while (true) {
+        const elapsed = performance.now() - startTime;
+        const t = Math.min(1, elapsed / sweepMs);
+
+        const currentBeat = startBeat + (endBeat - startBeat) * t;
+        const currentVolume = initialVolume + volumeBoost * t;
+
+        engine.setFrequencies(baseFrequency, currentBeat);
+        engine.setVolume(currentVolume / 100);
+        setVolume(currentVolume);
+
+        if (elapsed >= sweepMs) break;
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise<void>((resolve) => setTimeout(resolve, stepMs));
+      }
+
+      // Sustain 40 Hz Gamma for high-level insight
+      engine.setFrequencies(baseFrequency, endBeat);
+      engine.setVolume((initialVolume + volumeBoost) / 100);
+      setVolume(initialVolume + volumeBoost);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, sustainMs));
+
+      // Gently return to the original preset beat and volume
+      engine.setFrequencies(baseFrequency, initialBeat);
+      engine.setVolume(initialVolume / 100);
+      setVolume(initialVolume);
+    } finally {
+      awakeningSweepRef.current = false;
+    }
+  }, [ensureEngine, isPlaying, togglePlay, baseFrequency, volume, presetId, setVolume]);
+
   useEffect(() => {
     // Prepare the 1-second silence anchor audio element on the client
     if (typeof window === "undefined") return;
@@ -492,7 +550,8 @@ export function useHighVibe() {
     setAmbientVolume,
     togglePlay,
     setBreathIntensity,
-    softLanding
+    softLanding,
+    runAwakeningSweep
   };
 }
 

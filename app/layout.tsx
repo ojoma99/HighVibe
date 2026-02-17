@@ -5,8 +5,22 @@ export const metadata: Metadata = {
   title: "HighVibe",
   description: "High-frequency, unbiased enlightenment through sound and design.",
   manifest: "/manifest.json",
-  appleWebApp: { capable: true, title: "HighVibe" },
-  icons: { icon: "/icon.png", apple: "/icon.png" }
+  appleWebApp: {
+    capable: true,
+    title: "HighVibe",
+    statusBarStyle: "black-translucent"
+  },
+  icons: {
+    icon: [
+      { url: "/icon.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon.png", sizes: "512x512", type: "image/png" }
+    ],
+    apple: [
+      { url: "/icon.png", sizes: "180x180", type: "image/png" },
+      { url: "/icon.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon.png", sizes: "512x512", type: "image/png" }
+    ]
+  }
 };
 
 export const viewport: Viewport = {
@@ -25,7 +39,11 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full">
       <head>
-        <link rel="apple-touch-icon" href="/icon.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/icon.png" />
+        <link rel="apple-touch-icon" sizes="192x192" href="/icon.png" />
+        <link rel="apple-touch-icon" sizes="512x512" href="/icon.png" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
       </head>
       <body
         className="h-full bg-background text-foreground antialiased font-sans"

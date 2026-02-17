@@ -2,7 +2,7 @@
 
 import { AnimatePresence, motion, useAnimation } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Info, Play, Pause, Waves } from "lucide-react";
+import { Info, Play, Pause, Waves, Music2, Sparkles, ScanLine } from "lucide-react";
 import { useHighVibe } from "@/hooks/useHighVibe";
 
 const DAILY_RES_ONANCES = [
@@ -36,7 +36,8 @@ export default function Home() {
     setAmbientVolume,
     togglePlay,
     setBreathIntensity,
-    softLanding
+    softLanding,
+    runAwakeningSweep
   } = useHighVibe();
 
   const bgControls = useAnimation();
@@ -54,11 +55,45 @@ export default function Home() {
   const [showCompletionBloom, setShowCompletionBloom] = useState(false);
   const [truthPresetId, setTruthPresetId] = useState<string | null>(null);
 
+  type InsightEntry = {
+    id: string;
+    timestamp: string;
+    carrierHz: number;
+    beatHz: number;
+    note: string;
+  };
+
+  const [hasSessionContext, setHasSessionContext] = useState(false);
+  const [insightInput, setInsightInput] = useState("");
+  const [insightLedger, setInsightLedger] = useState<InsightEntry[]>([]);
+
+  const [isBioScanning, setIsBioScanning] = useState(false);
+  const [bioCoherence, setBioCoherence] = useState<number | null>(null);
+  const [bioStress, setBioStress] = useState<number | null>(null);
+  const [bioStatus, setBioStatus] = useState<string | null>(null);
+  const [bioWaveform, setBioWaveform] = useState<number[]>([]);
+  const [bioScanRemaining, setBioScanRemaining] = useState<number | null>(null);
+  const [bioScanResult, setBioScanResult] = useState<string | null>(null);
+  const [bioSignalQuality, setBioSignalQuality] = useState<"good" | "low" | null>(null);
+  const [bioIsWarmup, setBioIsWarmup] = useState(false);
+  const [bioSignalStrength, setBioSignalStrength] = useState<number>(0); // 0-100
+  const [bioSignalToNoise, setBioSignalToNoise] = useState<number | null>(null);
+  const [bioLowLightWarning, setBioLowLightWarning] = useState(false);
+  const [bioCameraMode, setBioCameraMode] = useState<"front" | "back">("front");
+  const [bioFlashEnabled, setBioFlashEnabled] = useState(false);
+  const [bioAvailableCameras, setBioAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [bioFingerLocked, setBioFingerLocked] = useState(false);
+  const [bioFingerLockDuration, setBioFingerLockDuration] = useState(0);
+  const [bioTimerPaused, setBioTimerPaused] = useState(false);
+
   const [portalActive, setPortalActive] = useState(false);
   const [portalFrequency, setPortalFrequency] = useState<285 | 417>(285);
   const [portalVolumeFrequency, setPortalVolumeFrequency] = useState(60);
   const [portalVolumeBass, setPortalVolumeBass] = useState(40);
   const [portalVolumeAtmosphere, setPortalVolumeAtmosphere] = useState(50);
+
+  type TabId = "beats" | "elevation" | "scan";
+  const [activeTab, setActiveTab] = useState<TabId>("beats");
 
   const portalAudioRef = useRef<{
     ctx: AudioContext;
@@ -71,6 +106,144 @@ export default function Home() {
   } | null>(null);
 
   const backgroundHumAudioRef = useRef<HTMLAudioElement | null>(null);
+  const bioVideoRef = useRef<HTMLVideoElement | null>(null);
+  const bioCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const bioAnimFrameRef = useRef<number | null>(null);
+  const bioSamplesRef = useRef<{ t: number; v: number }[]>([]);
+  const bioScanTimerRef = useRef<number | null>(null);
+  const bioScanStartTimeRef = useRef<number | null>(null);
+  const bioFilteredSignalRef = useRef<number[]>([]);
+  const bioROIRef = useRef<{ x: number; y: number; width: number; height: number } | null>(null);
+  const bioLowLightRef = useRef<boolean>(false);
+  const bioRGBHistoryRef = useRef<{ r: number; g: number; b: number; t: number }[]>([]);
+  const bioVideoTrackRef = useRef<MediaStreamTrack | null>(null);
+  const bioStreamRef = useRef<MediaStream | null>(null);
+  const bioLockStartTimeRef = useRef<number | null>(null);
+  const bioLastHapticTimeRef = useRef<number>(0);
+  const bioPauseStartTimeRef = useRef<number | null>(null);
+  const bioTotalPausedTimeRef = useRef<number>(0);
+
+  // Advanced signal processing functions
+  const applyMovingAverage = useCallback((signal: number[], windowSize: number): number[] => {
+    const result: number[] = [];
+    for (let i = 0; i < signal.length; i++) {
+      const start = Math.max(0, i - Math.floor(windowSize / 2));
+      const end = Math.min(signal.length, i + Math.ceil(windowSize / 2));
+      const window = signal.slice(start, end);
+      result.push(window.reduce((a, b) => a + b, 0) / window.length);
+    }
+    return result;
+  }, []);
+
+  const detrendSignal = useCallback((signal: number[]): number[] => {
+    // Remove slow linear trend
+    const n = signal.length;
+    const mean = signal.reduce((a, b) => a + b, 0) / n;
+    const xMean = (n - 1) / 2;
+    let numerator = 0;
+    let denominator = 0;
+    for (let i = 0; i < n; i++) {
+      numerator += (i - xMean) * (signal[i] - mean);
+      denominator += Math.pow(i - xMean, 2);
+    }
+    const slope = denominator !== 0 ? numerator / denominator : 0;
+    return signal.map((v, i) => v - (mean + slope * (i - xMean)));
+  }, []);
+
+  const butterworthBandpass = useCallback((signal: number[], sampleRate: number, lowFreq: number, highFreq: number): number[] => {
+    // Simplified 2nd-order Butterworth bandpass filter
+    // Using a simple IIR filter approximation
+    const nyquist = sampleRate / 2;
+    const lowNorm = lowFreq / nyquist;
+    const highNorm = highFreq / nyquist;
+    
+    // Simplified bandpass using moving average and high-pass
+    const filtered: number[] = [];
+    const alpha = 0.1; // Filter coefficient
+    
+    for (let i = 0; i < signal.length; i++) {
+      if (i === 0) {
+        filtered.push(signal[i]);
+      } else {
+        // High-pass component
+        const highPass = signal[i] - signal[i - 1];
+        // Low-pass component (moving average)
+        const lowPass = filtered[i - 1] + alpha * (signal[i] - filtered[i - 1]);
+        // Combine for bandpass
+        filtered.push(lowPass + highPass * 0.5);
+      }
+    }
+    return filtered;
+  }, []);
+
+  const extractCHROM = useCallback((rgbHistory: { r: number; g: number; b: number; t: number }[]): number[] => {
+    // CHROM algorithm: Xs = 3*R - 2*G, Ys = 1.5*R + G - 1.5*B
+    if (rgbHistory.length < 2) return [];
+    
+    const chromSignal: number[] = [];
+    for (let i = 1; i < rgbHistory.length; i++) {
+      const prev = rgbHistory[i - 1];
+      const curr = rgbHistory[i];
+      
+      const Xs = 3 * curr.r - 2 * curr.g;
+      const Ys = 1.5 * curr.r + curr.g - 1.5 * curr.b;
+      const XsPrev = 3 * prev.r - 2 * prev.g;
+      const YsPrev = 1.5 * prev.r + prev.g - 1.5 * prev.b;
+      
+      // Pulse signal from CHROM
+      const pulse = Xs - (XsPrev / YsPrev) * Ys;
+      chromSignal.push(pulse);
+    }
+    return chromSignal;
+  }, []);
+
+  const detectFaceROI = useCallback((imageData: ImageData, width: number, height: number): { x: number; y: number; width: number; height: number } | null => {
+    // Simplified ROI detection: assume face is centered, define forehead and cheek regions
+    // Forehead: top 20% of center region
+    // Cheeks: middle 40% of left and right regions
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const roiWidth = width * 0.6;
+    const roiHeight = height * 0.5;
+    
+    return {
+      x: centerX - roiWidth / 2,
+      y: centerY - roiHeight * 0.3, // Slightly above center for forehead
+      width: roiWidth,
+      height: roiHeight
+    };
+  }, []);
+
+  const calculateROIAverage = useCallback((imageData: ImageData, roi: { x: number; y: number; width: number; height: number }): { r: number; g: number; b: number; brightness: number } => {
+    const data = imageData.data;
+    const width = imageData.width;
+    let rSum = 0, gSum = 0, bSum = 0;
+    let pixelCount = 0;
+    
+    const startX = Math.max(0, Math.floor(roi.x));
+    const endX = Math.min(width, Math.floor(roi.x + roi.width));
+    const startY = Math.max(0, Math.floor(roi.y));
+    const endY = Math.min(imageData.height, Math.floor(roi.y + roi.height));
+    
+    for (let y = startY; y < endY; y++) {
+      for (let x = startX; x < endX; x++) {
+        const idx = (y * width + x) * 4;
+        rSum += data[idx];
+        gSum += data[idx + 1];
+        bSum += data[idx + 2];
+        pixelCount++;
+      }
+    }
+    
+    if (pixelCount === 0) return { r: 0, g: 0, b: 0, brightness: 0 };
+    
+    const r = rSum / pixelCount / 255;
+    const g = gSum / pixelCount / 255;
+    const b = bSum / pixelCount / 255;
+    const brightness = (r + g + b) / 3;
+    
+    return { r, g, b, brightness };
+  }, []);
 
   const breathActive = isPlaying && breathElapsedMs < 60000;
   const isDeepFlow = isPlaying && !breathActive;
@@ -118,6 +291,792 @@ export default function Home() {
     if (!isTimerRunning || !timerTotalMs || timerRemainingMs == null) return 1;
     return Math.max(0, Math.min(1, timerRemainingMs / timerTotalMs));
   }, [isTimerRunning, timerRemainingMs, timerTotalMs]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("highvibe_insight_ledger");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as InsightEntry[];
+      if (Array.isArray(parsed)) {
+        setInsightLedger(parsed);
+      }
+    } catch {
+      // ignore malformed storage
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "highvibe_insight_ledger",
+        JSON.stringify(insightLedger)
+      );
+    } catch {
+      // storage may be unavailable; fail softly
+    }
+  }, [insightLedger]);
+
+  const stopBioScan = useCallback(() => {
+    setIsBioScanning(false);
+    setBioScanRemaining(null);
+    setBioScanResult(null);
+    setBioSignalQuality(null);
+    setBioIsWarmup(false);
+    setBioSignalStrength(0);
+    setBioSignalToNoise(null);
+    setBioLowLightWarning(false);
+    setBioFlashEnabled(false);
+    setBioFingerLocked(false);
+    setBioFingerLockDuration(0);
+    setBioTimerPaused(false);
+    bioRGBHistoryRef.current = [];
+    bioFilteredSignalRef.current = [];
+    bioROIRef.current = null;
+    bioLockStartTimeRef.current = null;
+    if (bioAnimFrameRef.current != null) {
+      cancelAnimationFrame(bioAnimFrameRef.current);
+      bioAnimFrameRef.current = null;
+    }
+    if (bioScanTimerRef.current != null) {
+      window.clearInterval(bioScanTimerRef.current);
+      bioScanTimerRef.current = null;
+    }
+    
+    // Turn off flash if enabled
+    if (bioVideoTrackRef.current) {
+      try {
+        (bioVideoTrackRef.current as any).applyConstraints({ advanced: [{ torch: false }] } as any).catch(() => {});
+      } catch {}
+    }
+    
+    const video = bioVideoRef.current;
+    if (video && video.srcObject) {
+      (video.srcObject as MediaStream)
+        .getTracks()
+        .forEach((track) => track.stop());
+      video.srcObject = null;
+    }
+    
+    if (bioStreamRef.current) {
+      bioStreamRef.current.getTracks().forEach((track) => track.stop());
+      bioStreamRef.current = null;
+    }
+    
+    bioVideoTrackRef.current = null;
+    bioSamplesRef.current = [];
+    bioScanStartTimeRef.current = null;
+  }, []);
+
+  // Enumerate available cameras
+  const enumerateCameras = useCallback(async () => {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter((device) => device.kind === "videoinput");
+      setBioAvailableCameras(videoDevices);
+      return videoDevices;
+    } catch {
+      return [];
+    }
+  }, []);
+
+  // Toggle flash/torch
+  const toggleFlash = useCallback(async () => {
+    if (!bioVideoTrackRef.current || bioCameraMode !== "back") return;
+    
+    const newFlashState = !bioFlashEnabled;
+    try {
+      await (bioVideoTrackRef.current as any).applyConstraints({
+        advanced: [{ torch: newFlashState }]
+      } as any);
+      setBioFlashEnabled(newFlashState);
+    } catch {
+      // Flash not supported on this device
+      setBioFlashEnabled(false);
+    }
+  }, [bioFlashEnabled, bioCameraMode]);
+
+  // Flip camera
+  const flipCamera = useCallback(async () => {
+    if (!isBioScanning) return;
+    
+    const newMode = bioCameraMode === "front" ? "back" : "front";
+    setBioCameraMode(newMode);
+    
+    // Stop current stream
+    if (bioStreamRef.current) {
+      bioStreamRef.current.getTracks().forEach((track) => track.stop());
+    }
+    
+    // Turn off flash if switching away from back camera
+    if (bioCameraMode === "back" && bioFlashEnabled) {
+      setBioFlashEnabled(false);
+    }
+    
+    try {
+      // Get new stream with different camera (Xiaomi 15t Pro optimized)
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: newMode === "back" ? { ideal: "environment" } : "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          // Frame rate stabilization: Lock to 30fps
+          frameRate: { ideal: 30, min: 30, max: 30 },
+          advanced: [
+            { exposureMode: "manual" },
+            { focusMode: newMode === "back" ? "manual" : "continuous" },
+            { whiteBalanceMode: "auto" } // Will be set to manual after lock
+          ] as any
+        },
+        audio: false
+      });
+      
+      bioStreamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      bioVideoTrackRef.current = videoTrack;
+      
+      const video = bioVideoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+          void video.play().catch(() => {});
+        };
+      }
+      
+      // Auto-enable flash for back camera (finger PPG)
+      if (newMode === "back") {
+        try {
+          // Lock focus at minimum distance (Macro) for back camera
+          await (videoTrack as any).applyConstraints({
+            advanced: [
+              { torch: true },
+              { focusMode: "manual", focusDistance: 0 } // Macro focus
+            ]
+          } as any);
+          setBioFlashEnabled(true);
+        } catch {
+          // Flash not supported
+        }
+      }
+      
+      // Disable beauty filters and AI enhancements
+      try {
+        const trackSettings = videoTrack.getSettings() as any;
+        await (videoTrack as any).applyConstraints({
+          advanced: [
+            { colorTemperature: trackSettings.colorTemperature || 5500 },
+            { saturation: 1.0 },
+            { contrast: 1.0 },
+            { brightness: 0 }
+          ]
+        } as any);
+      } catch {
+        // Not all devices support these settings
+      }
+    } catch {
+      setBioStatus("Unable to switch camera. Check permissions.");
+    }
+  }, [isBioScanning, bioCameraMode, bioFlashEnabled]);
+
+  const startBioScan = useCallback(async () => {
+    if (typeof navigator === "undefined" || typeof window === "undefined") return;
+    if (!navigator.mediaDevices?.getUserMedia) return;
+
+    // Enumerate cameras first
+    await enumerateCameras();
+
+    try {
+      // Enhanced camera configuration optimized for Xiaomi 15t Pro
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: bioCameraMode === "back" ? { ideal: "environment" } : "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          // Frame rate stabilization: Lock to 30fps to prevent time-drift
+          frameRate: { ideal: 30, min: 30, max: 30 },
+          // Request exposure and focus lock to prevent hunting
+          advanced: [
+            { exposureMode: "manual" },
+            // Focus mode: continuous for front camera (rPPG), manual for back (PPG)
+            { focusMode: bioCameraMode === "back" ? "manual" : "continuous" },
+            { whiteBalanceMode: "auto" } // Will be set to manual after lock
+          ] as any
+        },
+        audio: false
+      });
+      
+      bioStreamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      bioVideoTrackRef.current = videoTrack;
+
+      // Apply camera settings optimized for Xiaomi 15t Pro
+      if (videoTrack && "getCapabilities" in videoTrack) {
+        const capabilities = videoTrack.getCapabilities();
+        const settings = videoTrack.getSettings();
+        
+        // Try to lock exposure and focus
+        if (videoTrack && "applyConstraints" in videoTrack) {
+          try {
+            if (bioCameraMode === "back") {
+              // Back Camera PPG: Lock focus at minimum distance (Macro) to prevent focus hunting
+              await (videoTrack as any).applyConstraints({
+                advanced: [
+                  { exposureMode: "manual", exposureCompensation: 0 },
+                  { focusMode: "manual", focusDistance: 0 } // Minimum focal length for macro
+                ]
+              } as any);
+            } else {
+              // Front Camera rPPG: Use continuous focus
+              await (videoTrack as any).applyConstraints({
+                advanced: [
+                  { exposureMode: "manual", exposureCompensation: 0 },
+                  { focusMode: "continuous" }
+                ]
+              } as any);
+            }
+          } catch {
+            // Some devices don't support manual controls; continue anyway
+          }
+        }
+        
+        // Auto-enable flash for back camera (finger PPG)
+        if (bioCameraMode === "back") {
+          try {
+            await (videoTrack as any).applyConstraints({
+              advanced: [{ torch: true }]
+            } as any);
+            setBioFlashEnabled(true);
+          } catch {
+            // Flash not supported on this device
+          }
+        }
+        
+        // Disable beauty filters and AI enhancements (Xiaomi-specific)
+        try {
+          const trackSettings = settings as any;
+          await (videoTrack as any).applyConstraints({
+            advanced: [
+              { colorTemperature: trackSettings.colorTemperature || 5500 },
+              { saturation: 1.0 },
+              { contrast: 1.0 },
+              { brightness: 0 }
+            ]
+          } as any);
+        } catch {
+          // Not all devices support these settings
+        }
+      }
+
+      const video = bioVideoRef.current;
+      if (!video) {
+        setIsBioScanning(false);
+        setBioStatus("Video element not available.");
+        return;
+      }
+      
+      video.srcObject = stream;
+      video.onloadedmetadata = () => {
+        void video.play().catch(() => {
+          setIsBioScanning(false);
+          setBioStatus("Unable to play video stream.");
+        });
+      };
+
+      setIsBioScanning(true);
+      setBioScanResult(null);
+      setBioSignalQuality(null);
+      setBioIsWarmup(true);
+      setBioSignalStrength(0);
+      setBioSignalToNoise(null);
+      setBioLowLightWarning(false);
+      setBioFingerLocked(false);
+      setBioFingerLockDuration(0);
+      setBioTimerPaused(false);
+      setBioStatus(bioCameraMode === "back" ? "Place finger over lens..." : "Signal Acquisition: Stabilizing...");
+      bioRGBHistoryRef.current = [];
+      bioFilteredSignalRef.current = [];
+      bioROIRef.current = null;
+      bioLockStartTimeRef.current = null;
+      bioPauseStartTimeRef.current = null;
+      bioTotalPausedTimeRef.current = 0;
+      
+      const SIGNAL_ACQUISITION_MS = 15000; // 15 seconds as requested
+      const SCAN_DURATION_MS = 60000;
+      bioScanStartTimeRef.current = Date.now();
+      setBioScanRemaining(SCAN_DURATION_MS);
+
+      // Countdown timer
+      bioScanTimerRef.current = window.setInterval(() => {
+        if (!bioScanStartTimeRef.current) return;
+        const elapsed = Date.now() - bioScanStartTimeRef.current;
+        const remaining = Math.max(0, SCAN_DURATION_MS - elapsed);
+        const acquisitionRemaining = Math.max(0, SIGNAL_ACQUISITION_MS - elapsed);
+        
+        // For back camera, check finger lock before starting timer
+        if (bioCameraMode === "back") {
+          if (!bioFingerLocked || bioTimerPaused) {
+            // Don't start timer until finger is locked for 2 seconds
+            setBioScanRemaining(SCAN_DURATION_MS);
+            setBioIsWarmup(true);
+            if (!bioFingerLocked) {
+              setBioStatus("Place finger over lens completely...");
+            } else {
+              setBioStatus(`Locking... ${(bioFingerLockDuration / 1000).toFixed(1)}s`);
+            }
+          } else if (bioFingerLockDuration >= 2000) {
+            // Finger locked for 2+ seconds, start timer (account for paused time)
+            const currentPausedTime = bioPauseStartTimeRef.current ? Date.now() - bioPauseStartTimeRef.current : 0;
+            const totalPaused = bioTotalPausedTimeRef.current + currentPausedTime;
+            const adjustedElapsed = elapsed - totalPaused;
+            const adjustedRemaining = Math.max(0, SCAN_DURATION_MS - adjustedElapsed);
+            const adjustedAcquisition = Math.max(0, SIGNAL_ACQUISITION_MS - adjustedElapsed);
+            
+            if (adjustedAcquisition > 0) {
+              setBioIsWarmup(true);
+              setBioScanRemaining(SCAN_DURATION_MS);
+              setBioStatus(`Signal Acquisition: ${(adjustedAcquisition / 1000).toFixed(1)}s...`);
+            } else {
+              setBioIsWarmup(false);
+              setBioScanRemaining(adjustedRemaining);
+              setBioStatus("Capturing Resonance.");
+            }
+          }
+        } else {
+          // Front camera: normal flow
+          if (acquisitionRemaining > 0) {
+            setBioIsWarmup(true);
+            setBioScanRemaining(SCAN_DURATION_MS);
+            setBioStatus(`Signal Acquisition: ${(acquisitionRemaining / 1000).toFixed(1)}s...`);
+          } else {
+            setBioIsWarmup(false);
+            setBioScanRemaining(remaining);
+            if (bioSignalQuality === "low" || bioSignalStrength < 30) {
+              setBioStatus("Stabilize finger & increase light.");
+            } else if (bioSignalStrength >= 70) {
+              setBioStatus("Capturing Resonance.");
+            } else {
+              setBioStatus("Scanning in progress...");
+            }
+          }
+        }
+        
+        if (remaining <= 0) {
+          if (bioScanTimerRef.current != null) {
+            window.clearInterval(bioScanTimerRef.current);
+            bioScanTimerRef.current = null;
+          }
+          setIsBioScanning(false);
+          
+          // Calculate final coherence and show result
+          const samples = bioSamplesRef.current;
+          // Filter samples collected after signal acquisition (first 5 seconds)
+          const recordingStartTime = bioScanStartTimeRef.current + SIGNAL_ACQUISITION_MS;
+          const validSamples = samples.filter((s) => {
+            const sampleTime = bioScanStartTimeRef.current ? s.t - (performance.now() - (Date.now() - bioScanStartTimeRef.current)) : s.t;
+            return sampleTime >= recordingStartTime;
+          });
+          
+          // Calculate Signal-to-Noise Ratio
+          if (validSamples.length > 10) {
+            const values = validSamples.map((s) => s.v);
+            const mean = values.reduce((acc, v) => acc + v, 0) / values.length;
+            const signalPower = values.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / values.length;
+            
+            // Estimate noise from high-frequency variations
+            const diffs = [];
+            for (let i = 1; i < values.length; i++) {
+              diffs.push(Math.abs(values[i] - values[i - 1]));
+            }
+            const noisePower = diffs.reduce((acc, v) => acc + v * v, 0) / (diffs.length || 1);
+            const snr = noisePower > 0 ? signalPower / noisePower : 0;
+            setBioSignalToNoise(snr);
+          }
+          
+          if (validSamples.length > 30 && (bioSignalToNoise === null || bioSignalToNoise > 0.5)) {
+            const values = validSamples.map((s) => s.v);
+            const mean = values.reduce((acc, v) => acc + v, 0) / values.length;
+            const centered = values.map((v) => v - mean);
+            
+            let max = -Infinity;
+            let min = Infinity;
+            for (const v of centered) {
+              if (v > max) max = v;
+              if (v < min) min = v;
+            }
+            const amplitude = max - min;
+            
+            const diffs: number[] = [];
+            for (let i = 1; i < centered.length; i++) {
+              diffs.push(centered[i] - centered[i - 1]);
+            }
+            const diffVar = diffs.reduce((acc, v) => acc + v * v, 0) / (diffs.length || 1);
+            const smoothness = 1 / Math.sqrt(diffVar + 1e-6);
+            const raw = amplitude * smoothness * 100;
+            const finalCoherence = Math.max(0, Math.min(100, raw));
+            
+            setBioCoherence(finalCoherence);
+            setBioStress(Math.max(0, Math.min(100, 100 - finalCoherence)));
+            
+            // Categorize result
+            if (finalCoherence <= 30) {
+              setBioScanResult("STAGNANT (0-30%)");
+              setBioStatus("The river is blocked. Use 432Hz to clear.");
+            } else if (finalCoherence <= 70) {
+              setBioScanResult("FLOWING (31-70%)");
+              setBioStatus("The river is moving. Ready for daily tasks.");
+            } else {
+              setBioScanResult("SOVEREIGN (71-100%)");
+              setBioStatus("The river is clear. Proceed to Direct Knowing / Awakening Sweep.");
+            }
+          } else if (validSamples.length <= 30) {
+            setBioScanResult("INSUFFICIENT DATA");
+            setBioStatus("Please try again. Keep your face or fingertip steady for the full 60 seconds.");
+          } else {
+            setBioScanResult("SIGNAL FRAGMENTED");
+            setBioStatus("Signal Fragmented. Please rest your hand on a flat surface and try again.");
+          }
+        }
+      }, 50);
+
+      const canvas = bioCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) return;
+
+      const loop = () => {
+        const v = bioVideoRef.current;
+        const c = bioCanvasRef.current;
+        if (!v || !c || !isBioScanning || v.readyState < 2 || bioScanRemaining === null || bioScanRemaining <= 0) {
+          if (bioScanRemaining === null || bioScanRemaining <= 0) {
+            bioAnimFrameRef.current = null;
+            return;
+          }
+          bioAnimFrameRef.current = requestAnimationFrame(loop);
+          return;
+        }
+
+        // Use higher resolution for better rPPG
+        const w = 320;
+        const h = 240;
+        c.width = w;
+        c.height = h;
+        ctx.drawImage(v, 0, 0, w, h);
+
+        const fullImageData = ctx.getImageData(0, 0, w, h);
+        
+        // Different ROI detection based on camera mode
+        let roi = bioROIRef.current;
+        if (!roi) {
+          if (bioCameraMode === "back") {
+            // For back camera (finger PPG), use center region
+            const centerX = w / 2;
+            const centerY = h / 2;
+            const roiSize = Math.min(w, h) * 0.4;
+            roi = {
+              x: centerX - roiSize / 2,
+              y: centerY - roiSize / 2,
+              width: roiSize,
+              height: roiSize
+            };
+          } else {
+            // For front camera (face rPPG), use face ROI
+            roi = detectFaceROI(fullImageData, w, h);
+          }
+          bioROIRef.current = roi;
+        }
+        
+        if (!roi) {
+          bioAnimFrameRef.current = requestAnimationFrame(loop);
+          return;
+        }
+
+        // Extract RGB values from ROI
+        const rgb = calculateROIAverage(fullImageData, roi);
+        
+        // For back camera (PPG), check finger alignment and lock state
+        if (bioCameraMode === "back") {
+          // Calculate red channel intensity (0-1)
+          const redIntensity = rgb.r;
+          const redSaturation = rgb.r / (rgb.r + rgb.g + rgb.b + 0.001);
+          
+          // Check for high-frequency leakage (ambient light)
+          const recentRedValues = bioRGBHistoryRef.current.slice(-10).map((s) => s.r);
+          let hasLeakage = false;
+          if (recentRedValues.length > 5) {
+            const redMean = recentRedValues.reduce((a, b) => a + b, 0) / recentRedValues.length;
+            const redVariance = recentRedValues.reduce((acc, v) => acc + Math.pow(v - redMean, 2), 0) / recentRedValues.length;
+            const redStdDev = Math.sqrt(redVariance);
+            // High variance indicates light leakage
+            hasLeakage = redStdDev > 0.05;
+          }
+          
+          // LOCKED state: Red intensity > 90% and no leakage
+          const isLocked = redIntensity > 0.9 && !hasLeakage && redSaturation > 0.6;
+          
+          if (isLocked) {
+            // Track lock duration
+            const wasJustLocked = !bioLockStartTimeRef.current;
+            if (wasJustLocked) {
+              bioLockStartTimeRef.current = Date.now();
+              // Haptic feedback when first locked
+              if (typeof navigator !== "undefined" && "vibrate" in navigator && Date.now() - bioLastHapticTimeRef.current > 1000) {
+                navigator.vibrate(50);
+                bioLastHapticTimeRef.current = Date.now();
+              }
+              
+              // Lock white balance once finger is locked (Xiaomi 15t Pro optimization)
+              if (bioVideoTrackRef.current) {
+                try {
+                  const trackSettings = bioVideoTrackRef.current.getSettings() as any;
+                  (bioVideoTrackRef.current as any).applyConstraints({
+                    advanced: [
+                      { whiteBalanceMode: "manual", colorTemperature: trackSettings.colorTemperature || 5500 }
+                    ]
+                  } as any).catch(() => {
+                    // White balance lock not supported
+                  });
+                } catch {
+                  // White balance lock not supported
+                }
+              }
+            }
+            if (bioLockStartTimeRef.current) {
+              const lockDuration = Date.now() - bioLockStartTimeRef.current;
+              setBioFingerLocked(true);
+              setBioFingerLockDuration(lockDuration);
+              setBioTimerPaused(false);
+            }
+          } else {
+            // Not locked - reset and pause timer
+            bioLockStartTimeRef.current = null;
+            setBioFingerLocked(false);
+            setBioFingerLockDuration(0);
+            if (bioScanStartTimeRef.current && !bioPauseStartTimeRef.current) {
+              // Start pause timer
+              bioPauseStartTimeRef.current = Date.now();
+              setBioTimerPaused(true);
+            }
+            if (!bioIsWarmup) {
+              setBioStatus("Cover lens completely.");
+            }
+          }
+          
+          // Resume timer if locked again after pause
+          if (isLocked && bioPauseStartTimeRef.current) {
+            bioTotalPausedTimeRef.current += Date.now() - bioPauseStartTimeRef.current;
+            bioPauseStartTimeRef.current = null;
+            setBioTimerPaused(false);
+          }
+        }
+        
+        // Check for low light (only for front camera)
+        if (bioCameraMode === "front") {
+          const isLowLight = rgb.brightness < 0.15;
+          bioLowLightRef.current = isLowLight;
+          setBioLowLightWarning(isLowLight);
+          
+          if (isLowLight && !bioIsWarmup) {
+            setBioStatus("Move closer to a soft light source or use the 'Glow UI' to illuminate your face.");
+          }
+        }
+
+        // Store RGB history
+        const now = performance.now();
+        bioRGBHistoryRef.current.push({ r: rgb.r, g: rgb.g, b: rgb.b, t: now });
+        
+        // Keep only last 60 seconds of data
+        const rgbWindowMs = 60000;
+        while (bioRGBHistoryRef.current.length > 0 && now - bioRGBHistoryRef.current[0].t > rgbWindowMs) {
+          bioRGBHistoryRef.current.shift();
+        }
+
+        // Different signal extraction based on camera mode
+        let processedSignal: number[] = [];
+        
+        if (bioCameraMode === "back") {
+          // Contact-PPG Mode: Use RED channel intensity shifts
+          const redValues = bioRGBHistoryRef.current.map((s) => s.r);
+          if (redValues.length > 1) {
+            // Detrend RED channel
+            processedSignal = detrendSignal(redValues);
+            
+            // Estimate sample rate
+            const sampleRate = bioRGBHistoryRef.current.length > 1 
+              ? 1000 / ((now - bioRGBHistoryRef.current[0].t) / (bioRGBHistoryRef.current.length - 1))
+              : 30;
+            
+            // Bandpass filter
+            processedSignal = butterworthBandpass(processedSignal, sampleRate, 0.7, 3.5);
+            
+            // Moving average smoothing
+            processedSignal = applyMovingAverage(processedSignal, 5);
+          }
+        } else {
+          // Front camera: Use CHROM algorithm
+          const chromSignal = extractCHROM(bioRGBHistoryRef.current);
+          
+          if (chromSignal.length === 0) {
+            bioAnimFrameRef.current = requestAnimationFrame(loop);
+            return;
+          }
+
+          // Apply signal processing pipeline
+          processedSignal = chromSignal;
+          
+          // 1. Detrending
+          processedSignal = detrendSignal(processedSignal);
+          
+          // 2. Butterworth bandpass filter (0.7Hz - 3.5Hz, 42-210 BPM)
+          const sampleRate = bioRGBHistoryRef.current.length > 1 
+            ? 1000 / ((now - bioRGBHistoryRef.current[0].t) / (bioRGBHistoryRef.current.length - 1))
+            : 30;
+          processedSignal = butterworthBandpass(processedSignal, sampleRate, 0.7, 3.5);
+          
+          // 3. Moving average smoothing
+          processedSignal = applyMovingAverage(processedSignal, 5);
+        }
+        
+        // Store filtered signal
+        bioFilteredSignalRef.current = processedSignal.slice(-1000);
+        
+        // Use the latest processed value as the pulse signal
+        const avg = processedSignal.length > 0 
+          ? processedSignal[processedSignal.length - 1] 
+          : (bioCameraMode === "back" ? rgb.r : rgb.g);
+        const elapsed = bioScanStartTimeRef.current ? Date.now() - bioScanStartTimeRef.current : 0;
+        const SIGNAL_ACQUISITION_MS = 5000;
+        const isAcquisitionPhase = elapsed < SIGNAL_ACQUISITION_MS;
+        
+        // Always collect samples, but mark acquisition phase
+        const samples = bioSamplesRef.current;
+        samples.push({ t: now, v: avg });
+
+        const windowMs = 60000; // Use full 60-second window for HRV
+        while (samples.length && now - samples[0].t > windowMs) {
+          samples.shift();
+        }
+
+        // Calculate signal strength and quality in real-time
+        if (samples.length > 5) {
+          const recentValues = samples.slice(-20).map((s) => s.v);
+          const mean = recentValues.reduce((acc, v) => acc + v, 0) / recentValues.length;
+          const variance = recentValues.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / recentValues.length;
+          const stdDev = Math.sqrt(variance);
+          
+          // Calculate amplitude (peak-to-peak)
+          const range = Math.max(...recentValues) - Math.min(...recentValues);
+          
+          // Detect rhythmic peaks (heartbeat pattern)
+          let peakConsistency = 0;
+          if (recentValues.length > 10) {
+            const centered = recentValues.map((v) => v - mean);
+            let peakCount = 0;
+            let peakIntervals: number[] = [];
+            let lastPeakIdx = -1;
+            
+            for (let i = 1; i < centered.length - 1; i++) {
+              if (centered[i] > centered[i - 1] && centered[i] > centered[i + 1] && centered[i] > stdDev * 0.5) {
+                if (lastPeakIdx >= 0) {
+                  peakIntervals.push(i - lastPeakIdx);
+                }
+                lastPeakIdx = i;
+                peakCount++;
+              }
+            }
+            
+            if (peakIntervals.length > 2) {
+              const avgInterval = peakIntervals.reduce((a, b) => a + b, 0) / peakIntervals.length;
+              const intervalVariance = peakIntervals.reduce((acc, v) => acc + Math.pow(v - avgInterval, 2), 0) / peakIntervals.length;
+              peakConsistency = Math.max(0, 100 - (Math.sqrt(intervalVariance) / avgInterval) * 100);
+            }
+          }
+          
+          // Signal strength: combination of amplitude, variance, and peak consistency
+          const amplitudeScore = Math.min(100, (range / 0.1) * 100);
+          const varianceScore = Math.min(100, (stdDev / 0.05) * 100);
+          const strength = (amplitudeScore * 0.4 + varianceScore * 0.3 + peakConsistency * 0.3);
+          setBioSignalStrength(Math.max(0, Math.min(100, strength)));
+          
+          // Signal quality: good if strength > 50 and peaks are consistent
+          const quality = strength > 50 && peakConsistency > 40 ? "good" : "low";
+          setBioSignalQuality(quality);
+          
+          // Update waveform for visualization using filtered signal
+          const filtered = bioFilteredSignalRef.current;
+          if (filtered.length > 0) {
+            const filteredMean = filtered.reduce((a, b) => a + b, 0) / filtered.length;
+            const filteredStd = Math.sqrt(
+              filtered.reduce((acc, v) => acc + Math.pow(v - filteredMean, 2), 0) / filtered.length
+            );
+            const shaped = filtered.slice(-60).map((v) =>
+              Math.max(0, Math.min(1, 0.5 + ((v - filteredMean) / (filteredStd + 0.01)) * 0.3))
+            );
+            setBioWaveform(shaped);
+          } else {
+            // Fallback to recent values if filtered signal not ready
+            const shaped = recentValues.slice(-60).map((v) =>
+              Math.max(0, Math.min(1, 0.5 + (v - mean) * 10))
+            );
+            setBioWaveform(shaped);
+          }
+        }
+
+        if (samples.length > 10 && !isAcquisitionPhase) {
+          const values = samples.map((s) => s.v);
+          const mean =
+            values.reduce((acc, v) => acc + v, 0) / values.length;
+          const centered = values.map((v) => v - mean);
+
+          let max = -Infinity;
+          let min = Infinity;
+          for (const v of centered) {
+            if (v > max) max = v;
+            if (v < min) min = v;
+          }
+          const amplitude = max - min;
+
+          const diffs: number[] = [];
+          for (let i = 1; i < centered.length; i++) {
+            diffs.push(centered[i] - centered[i - 1]);
+          }
+          const diffVar =
+            diffs.reduce((acc, v) => acc + v * v, 0) /
+            (diffs.length || 1);
+
+          const smoothness = 1 / Math.sqrt(diffVar + 1e-6);
+          const raw = amplitude * smoothness * 100;
+          const coherence = Math.max(0, Math.min(100, raw));
+
+          const stress = Math.max(0, Math.min(100, 100 - coherence));
+
+          setBioCoherence(coherence);
+          setBioStress(stress);
+          setHasSessionContext(true);
+
+          if (coherence > 70) {
+            setBioStatus("Flow State · Ready for Gnosis");
+          } else if (coherence > 40) {
+            setBioStatus("Transition State · Softening friction");
+          } else {
+            setBioStatus("Friction State · High load on the system");
+          }
+
+          const shaped = centered.map((v) =>
+            Math.max(0, Math.min(1, 0.5 + v * 4))
+          );
+          setBioWaveform(shaped.slice(-120));
+        }
+
+        bioAnimFrameRef.current = requestAnimationFrame(loop);
+      };
+
+      bioAnimFrameRef.current = requestAnimationFrame(loop);
+    } catch {
+      setIsBioScanning(false);
+      setBioStatus("Unable to access camera. Check permissions.");
+    }
+  }, [isBioScanning]);
 
   const ensurePortalAudio = useCallback(async () => {
     if (typeof window === "undefined") return null;
@@ -419,6 +1378,7 @@ export default function Home() {
         setTimerEndTs(null);
         setTimerRemainingMs(null);
       }
+      setHasSessionContext(true);
     } else {
       // Manual stop
       setIsTimerRunning(false);
@@ -437,6 +1397,22 @@ export default function Home() {
     }, 2000);
   };
 
+  const handleSaveInsight = () => {
+    const note = insightInput.trim();
+    if (!note) return;
+
+    const entry: InsightEntry = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      carrierHz: baseFrequency,
+      beatHz: beatFrequency,
+      note
+    };
+
+    setInsightLedger((prev) => [entry, ...prev].slice(0, 200));
+    setInsightInput("");
+  };
+
   const resonance = getTodayResonance();
 
   return (
@@ -447,9 +1423,20 @@ export default function Home() {
       />
 
       <div
-        className="relative z-10 mx-auto flex w-full max-w-4xl flex-col gap-8 rounded-3xl border border-white/5 bg-black/50 p-6 shadow-[0_0_80px_rgba(15,23,42,0.9)] backdrop-blur-2xl sm:p-10"
+        className="relative z-10 mx-auto flex w-full max-w-4xl flex-col gap-8 rounded-3xl border border-white/5 bg-black/50 p-6 shadow-[0_0_80px_rgba(15,23,42,0.9)] backdrop-blur-2xl pb-24 sm:p-10 sm:pb-24"
         onClick={handleTapToShowMinutes}
       >
+        <div className="min-h-[50vh]">
+          <AnimatePresence mode="wait">
+            {activeTab === "beats" && (
+              <motion.div
+                key="tab-beats"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25, ease: "easeOut" }}
+                className="flex flex-col gap-8"
+              >
         {/* Luminous Breath Pacer Aura + Ghost Timer Ring — at top of screen */}
         <AnimatePresence>
           {breathActive && (
@@ -658,51 +1645,71 @@ export default function Home() {
 
           <div className="space-y-6">
             <div className="space-y-3 rounded-2xl border border-white/10 bg-white/5 p-4">
-              <div className="flex items-center justify-between gap-2 text-xs text-slate-300">
-                <div>
-                  <div className="font-semibold tracking-[0.16em] uppercase text-slate-200">
-                    Carrier Frequency
-                  </div>
-                  <p className="mt-0.5 text-[0.7rem] text-slate-400">
-                    Shift the base pitch of both channels together.
-                  </p>
+              <div>
+                <div className="font-semibold tracking-[0.16em] uppercase text-slate-200">
+                  Sacred Carrier
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <input
-                    type="number"
-                    min={20}
-                    max={2000}
-                    step={0.1}
-                    value={baseFrequency}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      if (!Number.isNaN(v))
-                        setBaseFrequency(Math.max(20, Math.min(2000, v)));
-                    }}
-                    onBlur={(e) => {
-                      const v = Number(e.target.value);
-                      if (Number.isNaN(v) || v < 20 || v > 2000)
-                        setBaseFrequency(432);
-                    }}
-                    className="w-20 rounded-lg border border-white/15 bg-black/40 px-2 py-1.5 text-right text-sm font-semibold text-slate-100 outline-none focus:border-accent-soft/60 focus:ring-1 focus:ring-accent-soft/40 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                  />
-                  <span className="text-[0.7rem] text-slate-400">Hz</span>
-                </div>
+                <p className="mt-0.5 text-[0.7rem] text-slate-400">
+                  Choose the center frequency that anchors your binaural field.
+                </p>
               </div>
-              <input
-                type="range"
-                min={200}
-                max={600}
-                step={0.5}
-                value={Math.max(200, Math.min(600, baseFrequency))}
-                onChange={(e) => setBaseFrequency(Number(e.target.value))}
-                className="w-full accent-accent-soft"
-              />
-              <div className="flex justify-between text-[0.65rem] text-slate-500">
-                <span>Low carrier</span>
-                <span>432 Hz</span>
-                <span>440 Hz</span>
-                <span>Higher carrier</span>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={() => setBaseFrequency(432)}
+                  className={`group flex flex-col items-start gap-1 rounded-xl border px-3 py-2.5 text-left transition ${
+                    baseFrequency === 432
+                      ? "border-accent-soft/70 bg-white/10 shadow-aura/70"
+                      : "border-white/10 bg-white/3 hover:border-accent-soft/50 hover:bg-white/6"
+                  }`}
+                >
+                  <div className="flex w-full items-center justify-between">
+                    <span className="text-sm font-semibold text-slate-100">432 Hz</span>
+                    {baseFrequency === 432 && (
+                      <span className="h-2 w-2 rounded-full bg-accent-soft shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
+                    )}
+                  </div>
+                  <span className="text-[0.7rem] text-slate-400">Nature</span>
+                  <span className="text-[0.65rem] text-slate-500">Grounded & Natural</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setBaseFrequency(528)}
+                  className={`group flex flex-col items-start gap-1 rounded-xl border px-3 py-2.5 text-left transition ${
+                    baseFrequency === 528
+                      ? "border-accent-soft/70 bg-white/10 shadow-aura/70"
+                      : "border-white/10 bg-white/3 hover:border-accent-soft/50 hover:bg-white/6"
+                  }`}
+                >
+                  <div className="flex w-full items-center justify-between">
+                    <span className="text-sm font-semibold text-slate-100">528 Hz</span>
+                    {baseFrequency === 528 && (
+                      <span className="h-2 w-2 rounded-full bg-accent-soft shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
+                    )}
+                  </div>
+                  <span className="text-[0.7rem] text-slate-400">Miracle</span>
+                  <span className="text-[0.65rem] text-slate-500">Transformation & Love</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setBaseFrequency(963)}
+                  className={`group flex flex-col items-start gap-1 rounded-xl border px-3 py-2.5 text-left transition ${
+                    baseFrequency === 963
+                      ? "border-accent-soft/70 bg-white/10 shadow-aura/70"
+                      : "border-white/10 bg-white/3 hover:border-accent-soft/50 hover:bg-white/6"
+                  }`}
+                >
+                  <div className="flex w-full items-center justify-between">
+                    <span className="text-sm font-semibold text-slate-100">963 Hz</span>
+                    {baseFrequency === 963 && (
+                      <span className="h-2 w-2 rounded-full bg-accent-soft shadow-[0_0_8px_rgba(139,92,246,0.8)]" />
+                    )}
+                  </div>
+                  <span className="text-[0.7rem] text-slate-400">Divine</span>
+                  <span className="text-[0.65rem] text-slate-500">Higher Consciousness</span>
+                </button>
               </div>
             </div>
 
@@ -782,8 +1789,118 @@ export default function Home() {
           </div>
         </section>
 
+        <section className="mt-2 rounded-2xl border border-white/5 bg-gradient-to-r from-white/5 via-white/0 to-white/5 p-[1px]">
+          <div className="flex flex-col gap-4 rounded-2xl bg-black/60 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+            <div className="max-w-xl space-y-1.5">
+              <h2 className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">
+                Daily Resonance
+              </h2>
+              <p className="text-sm text-slate-200">{resonance}</p>
+            </div>
+            <div className="flex flex-col items-end gap-1 text-right text-[0.7rem] text-slate-400">
+              <div className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(74,222,128,0.9)]" />
+                <span>
+                  {isPlaying
+                    ? isDeepFlow
+                      ? "Deep Flow"
+                      : "Field active"
+                    : "Field idle"}
+                </span>
+              </div>
+              <span>
+                Δ {beatFrequency.toFixed(2)} Hz · Carrier{" "}
+                {baseFrequency.toFixed(1)} Hz
+              </span>
+            </div>
+          </div>
+        </section>
+
+        {hasSessionContext && (
+          <section className="mt-3 rounded-2xl border border-white/10 bg-white/5/70 p-[1px]">
+            <div className="space-y-3 rounded-2xl bg-slate-950/60 p-4 backdrop-blur-xl sm:p-5">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-300">
+                    Insight Ledger
+                  </h2>
+                  <p className="mt-1 text-[0.7rem] text-slate-400">
+                    Capture direct knowing that arises as the field settles.
+                  </p>
+                </div>
+                <div className="mt-1 text-right text-[0.7rem] text-slate-400/80">
+                  <div>Carrier {baseFrequency.toFixed(1)} Hz</div>
+                  <div>Δ {beatFrequency.toFixed(2)} Hz</div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-white/10/60 p-3 shadow-[0_0_30px_rgba(148,163,184,0.35)] backdrop-blur-xl">
+                <textarea
+                  rows={3}
+                  placeholder="Write the exact phrasing of what you now know to be true..."
+                  value={insightInput}
+                  onChange={(e) => setInsightInput(e.target.value)}
+                  className="w-full resize-none border-0 bg-transparent text-[0.8rem] font-light text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-0"
+                />
+                <div className="mt-2 flex items-center justify-between text-[0.7rem]">
+                  <span className="text-slate-400">
+                    Direct Knowing
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleSaveInsight}
+                    className="rounded-full border border-accent-soft/70 bg-accent-soft/20 px-3 py-1 text-[0.7rem] font-semibold tracking-[0.16em] text-slate-50 shadow-[0_0_20px_rgba(139,92,246,0.7)] transition hover:border-accent-soft hover:bg-accent-soft/30"
+                  >
+                    Save to Ledger
+                  </button>
+                </div>
+              </div>
+
+              {insightLedger.length > 0 && (
+                <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                  {insightLedger.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="rounded-xl border border-white/10 bg-gradient-to-r from-white/10 via-white/0 to-white/10 px-3 py-2 text-[0.7rem] font-light text-slate-100 shadow-[0_0_22px_rgba(148,163,184,0.45)]"
+                    >
+                      <div className="flex items-center justify-between text-[0.65rem] text-slate-400/90">
+                        <span>
+                          {new Date(entry.timestamp).toLocaleString()}
+                        </span>
+                        <span>
+                          {entry.carrierHz.toFixed(1)} Hz · Δ{" "}
+                          {entry.beatHz.toFixed(2)} Hz
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[0.75rem] font-extralight leading-relaxed text-slate-100/95">
+                        {entry.note}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        <footer className="mt-6 border-t border-white/5 pt-4 text-center text-[0.7rem] tracking-[0.2em] text-slate-500">
+          Created by Ojoma Abamu
+        </footer>
+
+              </motion.div>
+            )}
+
+            {activeTab === "elevation" && (
+              <motion.div
+                key="tab-elevation"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25, ease: "easeOut" }}
+                className="flex flex-col gap-8"
+              >
         {/* Instant Elevation */}
-        <section className={`mt-4 rounded-2xl border p-4 sm:p-5 ${
+        <section className={`rounded-2xl border p-4 sm:p-5 ${
           portalFrequency === 285
             ? "border-emerald-500/30 bg-emerald-950/20"
             : "border-purple-500/30 bg-purple-950/20"
@@ -805,7 +1922,11 @@ export default function Home() {
             </div>
             <button
               type="button"
-              onClick={togglePortal}
+              onClick={() => {
+                setHasSessionContext(true);
+                void runAwakeningSweep();
+                togglePortal();
+              }}
               className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
                 portalActive
                   ? portalFrequency === 285
@@ -819,7 +1940,7 @@ export default function Home() {
               <span className={`h-2 w-2 rounded-full shadow-[0_0_10px_rgba(74,222,128,0.9)] ${
                 portalFrequency === 285 ? "bg-emerald-400" : "bg-purple-400"
               }`} />
-              {portalActive ? "Elevation Active" : "Activate Elevation"}
+              7-Second Awakening Sweep
             </button>
           </div>
 
@@ -949,36 +2070,476 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="mt-2 rounded-2xl border border-white/5 bg-gradient-to-r from-white/5 via-white/0 to-white/5 p-[1px]">
-          <div className="flex flex-col gap-4 rounded-2xl bg-black/60 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
-            <div className="max-w-xl space-y-1.5">
-              <h2 className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">
-                Daily Resonance
+              </motion.div>
+            )}
+
+            {activeTab === "scan" && (
+              <motion.div
+                key="tab-scan"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25, ease: "easeOut" }}
+                className="flex flex-col gap-8"
+              >
+        {/* Bio-Scan – HRV & Stress */}
+        <section className="rounded-2xl border border-cyan-400/30 bg-cyan-950/10 p-4 sm:p-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="space-y-2">
+              <h2 className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200">
+                Bio-Scan · HRV & Stress
               </h2>
-              <p className="text-sm text-slate-200">{resonance}</p>
+              <p className="max-w-md text-[0.7rem] text-cyan-100/80">
+                Uses subtle color shifts (rPPG) to estimate nervous-system coherence. For a stronger signal,
+                gently rest a fingertip over the camera lens.
+              </p>
+              {bioCameraMode === "back" && (
+                <p className="max-w-md text-[0.65rem] italic text-amber-200/70">
+                  Optimal scan achieved via light touch; avoid pressing hard to keep the sensor cool.
+                </p>
+              )}
+              <p className="max-w-md text-[0.65rem] italic text-cyan-200/70">
+                Privacy: Your image is temporary; your frequency is eternal. Video is processed locally and
+                never stored or transmitted.
+              </p>
             </div>
-            <div className="flex flex-col items-end gap-1 text-right text-[0.7rem] text-slate-400">
-              <div className="flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(74,222,128,0.9)]" />
-                <span>
-                  {isPlaying
-                    ? isDeepFlow
-                      ? "Deep Flow"
-                      : "Field active"
-                    : "Field idle"}
-                </span>
+          </div>
+
+          <div className="mt-4 grid gap-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center">
+            <div className="flex flex-col items-center gap-3">
+              {/* Camera Controls */}
+              {isBioScanning && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void flipCamera()}
+                    className="flex h-8 w-8 items-center justify-center rounded-full border border-cyan-400/40 bg-cyan-500/10 text-cyan-200/80 shadow-[0_0_10px_rgba(34,211,238,0.3)] transition hover:bg-cyan-500/20 hover:text-cyan-100"
+                    title="Flip Camera"
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  </button>
+                  {bioCameraMode === "back" && (
+                    <button
+                      type="button"
+                      onClick={() => void toggleFlash()}
+                      className={`flex h-8 w-8 items-center justify-center rounded-full border shadow-[0_0_10px_rgba(251,191,36,0.3)] transition ${
+                        bioFlashEnabled
+                          ? "border-amber-400/60 bg-amber-500/20 text-amber-200 shadow-[0_0_15px_rgba(251,191,36,0.6)]"
+                          : "border-amber-400/30 bg-amber-500/10 text-amber-200/60 hover:bg-amber-500/20"
+                      }`}
+                      title="Toggle Flash"
+                    >
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="relative flex h-20 w-20 items-center justify-center">
+                {/* Finger Alignment Aura Circle (Back Camera Only) */}
+                {isBioScanning && bioCameraMode === "back" && (
+                  <motion.div
+                    className="absolute inset-0 flex items-center justify-center"
+                    initial={{ opacity: 0, scale: 0.8 }}
+                    animate={{
+                      opacity: bioFingerLocked ? 1 : 0.4,
+                      scale: bioFingerLocked ? 1.1 : 1,
+                    }}
+                    transition={{ duration: 0.3 }}
+                  >
+                    <div
+                      className={`h-24 w-24 rounded-full border-2 ${
+                        bioFingerLocked
+                          ? "border-red-400/80 bg-red-500/20 shadow-[0_0_40px_rgba(248,113,113,0.8)]"
+                          : "border-red-400/30 bg-red-500/10 shadow-[0_0_20px_rgba(248,113,113,0.4)]"
+                      }`}
+                      style={{
+                        filter: "blur(8px) brightness(1.2)",
+                        backdropFilter: "blur(4px)",
+                      }}
+                    >
+                      {!bioFingerLocked && (
+                        <motion.div
+                          className="h-full w-full rounded-full bg-red-400/20"
+                          animate={{
+                            opacity: [0.3, 0.6, 0.3],
+                            scale: [1, 1.05, 1],
+                          }}
+                          transition={{
+                            duration: 2,
+                            repeat: Infinity,
+                            ease: "easeInOut",
+                          }}
+                        />
+                      )}
+                    </div>
+                    {!bioFingerLocked && (
+                      <div className="absolute -bottom-6 text-[0.6rem] text-red-300/80">
+                        Cover lens completely.
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+                
+                {/* Countdown ring */}
+                {bioScanRemaining !== null && bioScanRemaining > 0 && (
+                  <svg className="absolute h-24 w-24 -rotate-90" viewBox="0 0 100 100">
+                    <circle
+                      cx="50"
+                      cy="50"
+                      r="45"
+                      fill="none"
+                      stroke="rgba(34,211,238,0.2)"
+                      strokeWidth="3"
+                    />
+                    <motion.circle
+                      cx="50"
+                      cy="50"
+                      r="45"
+                      fill="none"
+                      stroke="rgba(34,211,238,0.8)"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeDasharray={Math.PI * 2 * 45}
+                      initial={{ strokeDashoffset: 0 }}
+                      animate={{
+                        strokeDashoffset: (bioScanRemaining / 60000) * Math.PI * 2 * 45
+                      }}
+                      transition={{ duration: 0.05, ease: "linear" }}
+                    />
+                  </svg>
+                )}
+                <motion.button
+                  type="button"
+                  onClick={() => {
+                    if (isBioScanning) {
+                      stopBioScan();
+                    } else {
+                      void startBioScan();
+                    }
+                  }}
+                  className="relative z-10 flex h-20 w-20 items-center justify-center rounded-full border border-cyan-400/30 bg-white/5 backdrop-blur-xl text-[0.65rem] font-semibold uppercase tracking-[0.18em] text-cyan-50 shadow-[0_0_20px_rgba(34,211,238,0.3)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/80 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950"
+                  animate={
+                    isBioScanning && bioScanRemaining !== null && bioScanRemaining > 0
+                      ? {
+                          boxShadow: [
+                            "0 0 20px rgba(34,211,238,0.4)",
+                            "0 0 55px rgba(34,211,238,0.9)",
+                            "0 0 20px rgba(34,211,238,0.4)"
+                          ],
+                          scale: [1, 1.12, 1],
+                          opacity: [1, 0.9, 1]
+                        }
+                      : {
+                          boxShadow: "0 0 15px rgba(34,211,238,0.2)",
+                          scale: 1,
+                          opacity: 1
+                        }
+                  }
+                  transition={
+                    isBioScanning && bioScanRemaining !== null && bioScanRemaining > 0
+                      ? {
+                          duration: 5,
+                          repeat: Infinity,
+                          repeatType: "loop",
+                          ease: "easeInOut"
+                        }
+                      : { duration: 0.3, ease: "easeOut" }
+                  }
+                >
+                  {isBioScanning && bioScanRemaining !== null && bioScanRemaining > 0 && (
+                    <motion.span
+                      className="absolute inset-0 rounded-full bg-cyan-500/20 blur-xl"
+                      animate={{
+                        scale: [1, 1.3, 1],
+                        opacity: [0.6, 0.9, 0.6]
+                      }}
+                      transition={{
+                        duration: 5,
+                        repeat: Infinity,
+                        repeatType: "loop",
+                        ease: "easeInOut"
+                      }}
+                    />
+                  )}
+                  <span className="relative z-10 text-center leading-tight">
+                    {isBioScanning && bioScanRemaining !== null && bioScanRemaining > 0 && !bioIsWarmup
+                      ? `${(bioScanRemaining / 1000).toFixed(0)}s`
+                      : isBioScanning && bioIsWarmup
+                      ? "Acquiring..."
+                      : "Bio-Scan"}
+                  </span>
+                </motion.button>
               </div>
-              <span>
-                Δ {beatFrequency.toFixed(2)} Hz · Carrier{" "}
-                {baseFrequency.toFixed(1)} Hz
-              </span>
+              {/* Signal Strength Indicator */}
+              {isBioScanning && (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[0.65rem] text-cyan-100/70">Signal Strength</span>
+                    <div className="flex items-end gap-1">
+                      {[1, 2, 3].map((bar) => {
+                        const barHeight = bioSignalStrength > (bar - 1) * 33 ? Math.min(100, (bioSignalStrength - (bar - 1) * 33) / 33 * 100) : 0;
+                        const isActive = bioSignalStrength > (bar - 1) * 33;
+                        const color = isActive 
+                          ? (bioSignalStrength >= 70 ? "bg-emerald-400" : bioSignalStrength >= 30 ? "bg-amber-400" : "bg-red-400")
+                          : "bg-slate-600";
+                        return (
+                          <div
+                            key={bar}
+                            className={`w-2 rounded-t transition-all duration-300 ${color} ${
+                              isActive ? "shadow-[0_0_8px_currentColor]" : ""
+                            }`}
+                            style={{ 
+                              height: `${4 + barHeight * 0.12}px`,
+                              color: isActive ? (bioSignalStrength >= 70 ? "rgba(74,222,128,0.8)" : bioSignalStrength >= 30 ? "rgba(251,191,36,0.8)" : "rgba(248,113,113,0.8)") : "transparent"
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {bioSignalStrength < 30 && !bioIsWarmup && (
+                    <div className="text-[0.6rem] text-red-300/90 italic">
+                      Stabilize finger & increase light.
+                    </div>
+                  )}
+                  {bioSignalStrength >= 70 && !bioIsWarmup && (
+                    <div className="text-[0.6rem] text-emerald-300/90 italic">
+                      Capturing Resonance.
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              <div className="text-[0.65rem] text-cyan-100/80 text-center">
+                {bioStatus ?? "Tap Bio-Scan to begin a short check-in."}
+                {bioLowLightWarning && (
+                  <div className="mt-2 rounded-lg border border-amber-400/50 bg-amber-500/10 px-3 py-2 text-[0.65rem] text-amber-200/90">
+                    Move closer to a soft light source or use the 'Glow UI' to illuminate your face.
+                  </div>
+                )}
+              </div>
+              
+              {/* Results display */}
+              <AnimatePresence>
+                {bioScanResult && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -5 }}
+                    transition={{ duration: 0.5, ease: "easeOut" }}
+                    className="mt-2 max-w-xs space-y-1 rounded-xl border border-cyan-400/40 bg-gradient-to-br from-white/10 via-white/5 to-white/0 p-3 backdrop-blur-xl shadow-[0_0_30px_rgba(34,211,238,0.4)]"
+                  >
+                    <div className="text-center text-[0.75rem] font-semibold uppercase tracking-[0.2em] text-cyan-100">
+                      {bioScanResult}
+                    </div>
+                    <div className="text-center text-[0.7rem] font-light italic text-cyan-100/90">
+                      {bioStatus}
+                    </div>
+                    {bioCoherence != null && bioCoherence <= 30 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPresetId("relax");
+                          setBaseFrequency(432);
+                          setTimerMinutes(3);
+                        }}
+                        className="mt-2 w-full rounded-full border border-emerald-400/70 bg-emerald-500/20 px-3 py-1.5 text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-emerald-50 shadow-[0_0_20px_rgba(34,197,94,0.6)] transition hover:bg-emerald-500/30"
+                      >
+                        Start 432Hz Clear
+                      </button>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+              <video
+                ref={bioVideoRef}
+                className={`h-32 w-32 rounded-xl border border-cyan-400/50 object-cover shadow-[0_0_30px_rgba(34,211,238,0.5)] transition-opacity ${
+                  isBioScanning ? "opacity-100" : "opacity-0 pointer-events-none"
+                }`}
+                playsInline
+                muted
+                autoPlay
+              />
+              <canvas ref={bioCanvasRef} className="hidden" />
+            </div>
+
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
+                  <span>The Ojoma Factor · Resilience Meter</span>
+                  <span>
+                    {bioCoherence != null ? `${bioCoherence.toFixed(0)}%` : "--%"}
+                  </span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-slate-800/80">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-emerald-400 to-violet-400 shadow-[0_0_18px_rgba(34,211,238,0.8)]"
+                    style={{ width: `${Math.max(0, Math.min(100, bioCoherence ?? 0))}%` }}
+                  />
+                </div>
+                {bioStress != null && (
+                  <div className="flex justify-between text-[0.65rem] text-cyan-100/70">
+                    <span>Stress load: {bioStress.toFixed(0)}%</span>
+                    <span>
+                      {bioCoherence != null && bioCoherence > 70
+                        ? "Flow State · Ready for Gnosis"
+                        : bioCoherence != null && bioCoherence < 40
+                        ? "Friction State · Calm the River"
+                        : "Settling…"}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
+                  <span>Pulse Waveform</span>
+                </div>
+                <div className="h-24 overflow-hidden rounded-xl border border-cyan-400/30 bg-black/60 p-2 shadow-[0_0_28px_rgba(34,211,238,0.55)]">
+                  {bioWaveform.length > 0 ? (
+                    <svg viewBox="0 0 200 40" className="h-full w-full text-cyan-300/90" preserveAspectRatio="none">
+                      <defs>
+                        <linearGradient id="waveformGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                          <stop offset="0%" stopColor="rgba(34,211,238,0.3)" />
+                          <stop offset="100%" stopColor="rgba(34,211,238,0.9)" />
+                        </linearGradient>
+                        <filter id="glow">
+                          <feGaussianBlur stdDeviation="1" result="coloredBlur"/>
+                          <feMerge>
+                            <feMergeNode in="coloredBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                          </feMerge>
+                        </filter>
+                      </defs>
+                      <polyline
+                        fill="none"
+                        stroke="url(#waveformGradient)"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        filter="url(#glow)"
+                        points={bioWaveform
+                          .map((v, i) => {
+                            const x = (i / Math.max(1, bioWaveform.length - 1)) * 200;
+                            const y = 40 - v * 36 - 2;
+                            return `${x},${y}`;
+                          })
+                          .join(" ")}
+                      />
+                    </svg>
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-[0.65rem] text-cyan-200/60">
+                      Waveform will appear during signal acquisition...
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {bioCoherence != null && (
+                <div className="space-y-1.5 text-[0.7rem] text-cyan-100/85">
+                  {bioCoherence < 40 && (
+                    <div className="flex flex-col gap-1 rounded-xl border border-emerald-400/30 bg-emerald-500/10 p-3">
+                      <div className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-emerald-200">
+                        Friction State · Calm the River
+                      </div>
+                      <p className="text-[0.7rem] text-emerald-100/85">
+                        Your system is carrying a higher load. A 3-minute 10 Hz Alpha field at 432 Hz can help wash the
+                        banks of the river.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPresetId("relax");
+                          setBaseFrequency(432);
+                          setTimerMinutes(3);
+                        }}
+                        className="mt-1 inline-flex w-fit items-center rounded-full border border-emerald-400/70 bg-emerald-500/20 px-3 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-emerald-50 shadow-[0_0_20px_rgba(34,197,94,0.6)]"
+                      >
+                        Start Calm the River
+                      </button>
+                    </div>
+                  )}
+                  {bioCoherence >= 70 && (
+                    <div className="flex flex-col gap-1 rounded-xl border border-fuchsia-400/40 bg-fuchsia-500/10 p-3">
+                      <div className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-fuchsia-100">
+                        Flow State · Ready for Gnosis
+                      </div>
+                      <p className="text-[0.7rem] text-fuchsia-100/85">
+                        Coherence is high. The Awakening Sweep and Insight Ledger are primed for clear Direct Knowing.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </section>
 
-        <footer className="mt-6 border-t border-white/5 pt-4 text-center text-[0.7rem] tracking-[0.2em] text-slate-500">
-          Created by Ojoma Abamu
-        </footer>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Fixed bottom navigation */}
+        <nav className="fixed bottom-0 left-0 right-0 z-30 flex items-center justify-center border-t border-white/10 bg-slate-950/95 backdrop-blur-xl">
+          <div className="flex w-full max-w-4xl items-center justify-around px-2 py-2">
+            <button
+              type="button"
+              onClick={() => setActiveTab("beats")}
+              className={`relative flex flex-col items-center gap-1 rounded-lg px-4 py-2 transition ${
+                activeTab === "beats"
+                  ? "text-emerald-400"
+                  : "text-slate-400 hover:text-slate-300"
+              }`}
+            >
+              <Music2 className="h-5 w-5" />
+              <span className="text-[0.65rem] font-medium uppercase tracking-wider">
+                Beats
+              </span>
+              {activeTab === "beats" && (
+                <span className="absolute bottom-0 left-1/2 h-0.5 w-8 -translate-x-1/2 rounded-full bg-emerald-400" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("elevation")}
+              className={`relative flex flex-col items-center gap-1 rounded-lg px-4 py-2 transition ${
+                activeTab === "elevation"
+                  ? "text-emerald-400"
+                  : "text-slate-400 hover:text-slate-300"
+              }`}
+            >
+              <Sparkles className="h-5 w-5" />
+              <span className="text-[0.65rem] font-medium uppercase tracking-wider">
+                Elevate
+              </span>
+              {activeTab === "elevation" && (
+                <span className="absolute bottom-0 left-1/2 h-0.5 w-8 -translate-x-1/2 rounded-full bg-emerald-400" />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("scan")}
+              className={`relative flex flex-col items-center gap-1 rounded-lg px-4 py-2 transition ${
+                activeTab === "scan"
+                  ? "text-emerald-400"
+                  : "text-slate-400 hover:text-slate-300"
+              }`}
+            >
+              <ScanLine className="h-5 w-5" />
+              <span className="text-[0.65rem] font-medium uppercase tracking-wider">
+                Scan
+              </span>
+              {activeTab === "scan" && (
+                <span className="absolute bottom-0 left-1/2 h-0.5 w-8 -translate-x-1/2 rounded-full bg-emerald-400" />
+              )}
+            </button>
+          </div>
+        </nav>
 
         {/* Breath guidance text overlay */}
         <AnimatePresence>
