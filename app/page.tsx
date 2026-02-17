@@ -2,7 +2,7 @@
 
 import { AnimatePresence, motion, useAnimation } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Info, Play, Pause, Waves, Music2, Sparkles, ScanLine } from "lucide-react";
+import { Info, Play, Pause, Waves, Music2, Sparkles, ScanLine, Watch, Link2, X } from "lucide-react";
 import { useHighVibe } from "@/hooks/useHighVibe";
 
 const DAILY_RES_ONANCES = [
@@ -19,6 +19,11 @@ function getTodayResonance() {
 }
 
 export default function Home() {
+  // TODO: Replace this with your real Google OAuth Client ID.
+  // You asked to use: [PASTE YOUR CLIENT ID HERE]
+  const GOOGLE_FIT_CLIENT_ID =
+    "668520871990-np7fjekk40ui5mbnaah0bfpnftfpqi4v.apps.googleusercontent.com";
+
   const {
     isPlaying,
     baseFrequency,
@@ -37,6 +42,7 @@ export default function Home() {
     togglePlay,
     setBreathIntensity,
     softLanding,
+    hardStop,
     runAwakeningSweep
   } = useHighVibe();
 
@@ -89,6 +95,23 @@ export default function Home() {
   const [bioFocusQuality, setBioFocusQuality] = useState<number>(0); // 0-100, based on contrast
   const [bioMotionOffset, setBioMotionOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [bioVibrationLevel, setBioVibrationLevel] = useState<number>(0); // 0-100, motion intensity
+  const [bioPressureTooHigh, setBioPressureTooHigh] = useState(false);
+  const [bioConsecutiveBeats, setBioConsecutiveBeats] = useState(0); // Track consecutive beats
+  const [bioLockConfidence, setBioLockConfidence] = useState(0); // 0-100, confidence in lock quality
+  const [bioFingerprintPulse, setBioFingerprintPulse] = useState(0); // 0-1, pulse intensity for animation
+
+  const [watchSyncOpen, setWatchSyncOpen] = useState(false);
+  const [watchSyncStatus, setWatchSyncStatus] = useState<"disconnected" | "connected">("disconnected");
+  const [watchSyncSource, setWatchSyncSource] = useState<"dafit" | "googlefit" | "healthkit" | "manual" | null>(null);
+  const [watchAvgHeartRate, setWatchAvgHeartRate] = useState<number | null>(null); // bpm
+  const [watchSleepScore, setWatchSleepScore] = useState<number | null>(null); // 0-100 (manual only)
+  const [watchSleepHours, setWatchSleepHours] = useState<number | null>(null); // hours (Google Fit sleep segments)
+  const [watchResonance, setWatchResonance] = useState<number | null>(null); // 0-100 derived from watch data
+  const [watchResonanceBand, setWatchResonanceBand] = useState<"Low" | "High" | "Balanced" | null>(null);
+  const [watchSyncError, setWatchSyncError] = useState<string | null>(null);
+  const [watchIntegratedMsg, setWatchIntegratedMsg] = useState<string | null>(null);
+  const [watchSyncing, setWatchSyncing] = useState(false);
+  const [watchSyncingStep, setWatchSyncingStep] = useState<string | null>(null);
 
   const [portalActive, setPortalActive] = useState(false);
   const [portalFrequency, setPortalFrequency] = useState<285 | 417>(285);
@@ -129,6 +152,15 @@ export default function Home() {
   const bioAnchorPointsRef = useRef<{ x: number; y: number }[]>([]); // 5 anchor points for motion tracking
   const bioPrevImageDataRef = useRef<ImageData | null>(null); // Previous frame for optical flow
   const bioMotionOffsetRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 }); // Cumulative motion offset
+  const bioWaveformCanvasRef = useRef<HTMLCanvasElement | null>(null); // Canvas for pulse waveform
+  const bioGreenHistoryRef = useRef<number[]>([]); // Green channel history for pressure detection
+  const bioBeatConfidenceRef = useRef<number[]>([]); // Store beat confidence scores
+  const bioCenterGreenHistoryRef = useRef<number[]>([]); // Average Green channel of center square
+  const bioRedBrightnessHistoryRef = useRef<number[]>([]); // Red brightness history for motion detection
+  const bioDataCollectionPausedRef = useRef<boolean>(false); // Pause data collection on motion
+
+  const googleGisLoadedRef = useRef(false);
+  const googleTokenClientRef = useRef<any>(null);
 
   // Advanced signal processing functions
   const applyMovingAverage = useCallback((signal: number[], windowSize: number): number[] => {
@@ -819,6 +851,15 @@ export default function Home() {
       bioMotionOffsetRef.current = { x: 0, y: 0 };
       setBioMotionOffset({ x: 0, y: 0 });
       setBioVibrationLevel(0);
+      setBioPressureTooHigh(false);
+      setBioConsecutiveBeats(0);
+      setBioLockConfidence(0);
+      setBioFingerprintPulse(0);
+      bioBeatConfidenceRef.current = [];
+      bioGreenHistoryRef.current = [];
+      bioCenterGreenHistoryRef.current = [];
+      bioRedBrightnessHistoryRef.current = [];
+      bioDataCollectionPausedRef.current = false;
       
       const SIGNAL_ACQUISITION_MS = 15000; // 15 seconds as requested
       const SCAN_DURATION_MS = 60000;
@@ -881,6 +922,14 @@ export default function Home() {
         }
         
         if (remaining <= 0) {
+          // For Finger Scan: Only complete if 10 consecutive beats detected
+          if (bioScanMode === "finger" && bioConsecutiveBeats < 10) {
+            // Extend scan if beats not detected
+            setBioScanRemaining(5000); // Add 5 more seconds
+            setBioStatus(`Waiting for ${10 - bioConsecutiveBeats} more beats...`);
+            return;
+          }
+          
           if (bioScanTimerRef.current != null) {
             window.clearInterval(bioScanTimerRef.current);
             bioScanTimerRef.current = null;
@@ -1088,11 +1137,75 @@ export default function Home() {
         const focusQuality = Math.min(100, (laplacianVariance / 500) * 100);
         setBioFocusQuality(focusQuality);
         
-        // For Finger Scan mode, check finger alignment and lock state
+        // For Finger Scan mode, use Temporal Filtering and Motion Detection
         if (bioScanMode === "finger") {
-          // Calculate red channel intensity (0-1)
+          // Calculate average Green channel of entire center-square (Temporal Filtering)
+          const centerSquareSize = Math.min(w, h) * 0.6; // 60% of smaller dimension
+          const centerX = w / 2;
+          const centerY = h / 2;
+          const startX = Math.max(0, Math.floor(centerX - centerSquareSize / 2));
+          const endX = Math.min(w, Math.floor(centerX + centerSquareSize / 2));
+          const startY = Math.max(0, Math.floor(centerY - centerSquareSize / 2));
+          const endY = Math.min(h, Math.floor(centerY + centerSquareSize / 2));
+          
+          let centerGreenSum = 0;
+          let centerPixelCount = 0;
+          for (let y = startY; y < endY; y++) {
+            for (let x = startX; x < endX; x++) {
+              const idx = (y * w + x) * 4;
+              centerGreenSum += fullImageData.data[idx + 1]; // Green channel
+              centerPixelCount++;
+            }
+          }
+          const avgCenterGreen = centerGreenSum / centerPixelCount / 255; // Normalize to 0-1
+          
+          // Store center Green channel history
+          bioCenterGreenHistoryRef.current.push(avgCenterGreen);
+          if (bioCenterGreenHistoryRef.current.length > 100) {
+            bioCenterGreenHistoryRef.current.shift(); // Keep last 100 samples
+          }
+          
+          // Enhanced Redness Check: Calculate average pixel redness in ROI
           const redIntensity = rgb.r;
+          const greenIntensity = rgb.g;
+          const blueIntensity = rgb.b;
           const redSaturation = rgb.r / (rgb.r + rgb.g + rgb.b + 0.001);
+          const redBrightness = rgb.brightness;
+          
+          // Check if significantly Red/Pink (red > green and red > blue, and red saturation > 0.5)
+          const isRedPink = redIntensity > greenIntensity && redIntensity > blueIntensity && redSaturation > 0.5 && redIntensity > 0.6;
+          
+          // Motion Detection: Monitor sudden shifts in red brightness
+          bioRedBrightnessHistoryRef.current.push(redBrightness);
+          if (bioRedBrightnessHistoryRef.current.length > 10) {
+            bioRedBrightnessHistoryRef.current.shift(); // Keep last 10 samples
+          }
+          
+          let motionDetected = false;
+          if (bioRedBrightnessHistoryRef.current.length >= 5) {
+            const recentBrightness = bioRedBrightnessHistoryRef.current.slice(-5);
+            const currentBrightness = recentBrightness[recentBrightness.length - 1];
+            const previousBrightness = recentBrightness[0];
+            const brightnessChange = Math.abs(currentBrightness - previousBrightness);
+            
+            // If brightness shifts suddenly (>0.15), assume finger moved
+            motionDetected = brightnessChange > 0.15;
+            
+            if (motionDetected) {
+              bioDataCollectionPausedRef.current = true;
+              setBioStatus("Finger moved. Hold steady...");
+            } else if (bioDataCollectionPausedRef.current) {
+              // Wait for stability (low variance) before resuming
+              const brightnessVariance = recentBrightness.reduce((acc, v, i, arr) => {
+                const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+                return acc + Math.pow(v - mean, 2);
+              }, 0) / recentBrightness.length;
+              
+              if (brightnessVariance < 0.001) { // Stable
+                bioDataCollectionPausedRef.current = false;
+              }
+            }
+          }
           
           // Check for high-frequency leakage (ambient light)
           const recentRedValues = bioRGBHistoryRef.current.slice(-10).map((s) => s.r);
@@ -1105,8 +1218,77 @@ export default function Home() {
             hasLeakage = redStdDev > 0.05;
           }
           
-          // LOCKED state: Red intensity > 90% and no leakage
-          const isLocked = redIntensity > 0.9 && !hasLeakage && redSaturation > 0.6;
+          // Pressure Detection: Monitor Green channel variance
+          bioGreenHistoryRef.current.push(greenIntensity);
+          if (bioGreenHistoryRef.current.length > 30) {
+            bioGreenHistoryRef.current.shift(); // Keep last 30 samples
+          }
+          
+          let pressureTooHigh = false;
+          if (bioGreenHistoryRef.current.length > 20) {
+            const greenMean = bioGreenHistoryRef.current.reduce((a, b) => a + b, 0) / bioGreenHistoryRef.current.length;
+            const greenVariance = bioGreenHistoryRef.current.reduce((acc, v) => acc + Math.pow(v - greenMean, 2), 0) / bioGreenHistoryRef.current.length;
+            const greenStdDev = Math.sqrt(greenVariance);
+            
+            // If brightness is high but variance is very low, pressure is too high (blood flow blocked)
+            pressureTooHigh = rgb.brightness > 0.7 && greenStdDev < 0.01;
+            setBioPressureTooHigh(pressureTooHigh);
+          }
+          
+          // Calculate Lock Confidence: Based on red steadiness and pulse wave detection
+          let lockConfidence = 0;
+          if (isRedPink && !hasLeakage && !pressureTooHigh && !motionDetected) {
+            // Red steadiness (low variance in red brightness)
+            const redSteadiness = bioRedBrightnessHistoryRef.current.length >= 10
+              ? Math.max(0, 100 - (Math.sqrt(
+                  bioRedBrightnessHistoryRef.current.reduce((acc, v, i, arr) => {
+                    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+                    return acc + Math.pow(v - mean, 2);
+                  }, 0) / bioRedBrightnessHistoryRef.current.length
+                ) * 1000))
+              : 0;
+            
+            // Pulse wave detection (rhythmic variation in center Green channel)
+            let pulseDetected = 0;
+            if (bioCenterGreenHistoryRef.current.length > 30) {
+              const greenSignal = bioCenterGreenHistoryRef.current.slice(-30);
+              const greenMean = greenSignal.reduce((a, b) => a + b, 0) / greenSignal.length;
+              const greenStd = Math.sqrt(
+                greenSignal.reduce((acc, v) => acc + Math.pow(v - greenMean, 2), 0) / greenSignal.length
+              );
+              
+              // Detect rhythmic peaks (heartbeat pattern)
+              let peakCount = 0;
+              for (let i = 1; i < greenSignal.length - 1; i++) {
+                if (greenSignal[i] > greenSignal[i - 1] && greenSignal[i] > greenSignal[i + 1] && 
+                    greenSignal[i] > greenMean + greenStd * 0.3) {
+                  peakCount++;
+                }
+              }
+              
+              // Pulse detected if we have 2-6 peaks in 30 samples (40-120 BPM range)
+              pulseDetected = peakCount >= 2 && peakCount <= 6 ? Math.min(100, peakCount * 20) : 0;
+            }
+            
+            // Combine red steadiness (50%) and pulse detection (50%)
+            lockConfidence = Math.min(100, (redSteadiness * 0.5 + pulseDetected * 0.5));
+            setBioLockConfidence(lockConfidence);
+            
+            // Update fingerprint pulse animation intensity based on center Green channel variation
+            if (bioCenterGreenHistoryRef.current.length > 10) {
+              const recentGreen = bioCenterGreenHistoryRef.current.slice(-10);
+              const greenMin = Math.min(...recentGreen);
+              const greenMax = Math.max(...recentGreen);
+              const pulseIntensity = (greenMax - greenMin) * 2; // Amplify for visibility
+              setBioFingerprintPulse(Math.min(1, Math.max(0, pulseIntensity)));
+            }
+          } else {
+            setBioLockConfidence(0);
+            setBioFingerprintPulse(0);
+          }
+          
+          // LOCKED state: Must be Red/Pink, no leakage, no pressure, no motion, and good confidence
+          const isLocked = isRedPink && !hasLeakage && !pressureTooHigh && !motionDetected && lockConfidence > 30;
           
           if (isLocked) {
             // Track lock duration
@@ -1158,7 +1340,13 @@ export default function Home() {
               setBioTimerPaused(true);
             }
             if (!bioIsWarmup) {
-              setBioStatus("Cover lens completely.");
+              if (!isRedPink) {
+                setBioStatus("Place finger over lens.");
+              } else if (pressureTooHigh) {
+                setBioStatus("Pressure too high—Press Lighter.");
+              } else {
+                setBioStatus("Cover lens completely.");
+              }
             }
           }
           
@@ -1181,9 +1369,11 @@ export default function Home() {
           }
         }
 
-        // Store RGB history
+        // Store RGB history (only if data collection not paused for Finger Scan)
         const now = performance.now();
-        bioRGBHistoryRef.current.push({ r: rgb.r, g: rgb.g, b: rgb.b, t: now });
+        if (!(bioScanMode === "finger" && bioDataCollectionPausedRef.current)) {
+          bioRGBHistoryRef.current.push({ r: rgb.r, g: rgb.g, b: rgb.b, t: now });
+        }
         
         // Keep only last 60 seconds of data
         const rgbWindowMs = 60000;
@@ -1247,6 +1437,98 @@ export default function Home() {
         const elapsed = bioScanStartTimeRef.current ? Date.now() - bioScanStartTimeRef.current : 0;
         const SIGNAL_ACQUISITION_MS = 5000;
         const isAcquisitionPhase = elapsed < SIGNAL_ACQUISITION_MS;
+        
+        // Beat Detection for Finger Scan: Detect peaks in processed signal
+        if (bioScanMode === "finger" && processedSignal.length > 10) {
+          const recentSignal = processedSignal.slice(-30); // Last 30 samples
+          const mean = recentSignal.reduce((a, b) => a + b, 0) / recentSignal.length;
+          const stdDev = Math.sqrt(recentSignal.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / recentSignal.length);
+          
+          // Detect peak (local maximum above threshold)
+          const lastIdx = processedSignal.length - 1;
+          if (lastIdx >= 2) {
+            const prev = processedSignal[lastIdx - 1];
+            const curr = processedSignal[lastIdx];
+            const next = processedSignal[lastIdx - 2] || curr;
+            
+            // Peak detection: current > previous AND current > next AND above threshold
+            const isPeak = curr > prev && curr > next && curr > mean + stdDev * 0.5;
+            
+            if (isPeak) {
+              // Calculate confidence based on peak prominence
+              const prominence = curr - Math.max(prev, next);
+              const confidence = Math.min(100, (prominence / (stdDev + 0.001)) * 50);
+              
+              bioBeatConfidenceRef.current.push(confidence);
+              if (bioBeatConfidenceRef.current.length > 20) {
+                bioBeatConfidenceRef.current.shift();
+              }
+              
+              // Check if last 10 beats have high confidence (>70%)
+              if (bioBeatConfidenceRef.current.length >= 10) {
+                const recentConfidence = bioBeatConfidenceRef.current.slice(-10);
+                const avgConfidence = recentConfidence.reduce((a, b) => a + b, 0) / recentConfidence.length;
+                
+                if (avgConfidence > 70) {
+                  setBioConsecutiveBeats(10);
+                } else {
+                  // Reset if confidence drops
+                  const highConfidenceCount = recentConfidence.filter(c => c > 70).length;
+                  setBioConsecutiveBeats(highConfidenceCount);
+                }
+              } else {
+                const highConfidenceCount = bioBeatConfidenceRef.current.filter(c => c > 70).length;
+                setBioConsecutiveBeats(highConfidenceCount);
+              }
+            }
+          }
+        }
+        
+        // Draw Pulse Waveform on Canvas
+        if (bioWaveformCanvasRef.current && processedSignal.length > 0) {
+          const canvas = bioWaveformCanvasRef.current;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            canvas.width = canvas.offsetWidth * 2; // High DPI
+            canvas.height = canvas.offsetHeight * 2;
+            ctx.scale(2, 2);
+            
+            const width = canvas.width / 2;
+            const height = canvas.height / 2;
+            
+            // Clear canvas
+            ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+            ctx.fillRect(0, 0, width, height);
+            
+            // Draw waveform
+            const waveformData = processedSignal.slice(-200); // Last 200 samples
+            if (waveformData.length > 1) {
+              const min = Math.min(...waveformData);
+              const max = Math.max(...waveformData);
+              const range = max - min || 1;
+              
+              ctx.strokeStyle = "rgba(34, 211, 238, 0.9)";
+              ctx.lineWidth = 2;
+              ctx.shadowBlur = 8;
+              ctx.shadowColor = "rgba(34, 211, 238, 0.8)";
+              ctx.beginPath();
+              
+              for (let i = 0; i < waveformData.length; i++) {
+                const x = (i / (waveformData.length - 1)) * width;
+                const normalized = (waveformData[i] - min) / range;
+                const y = height - (normalized * height * 0.8 + height * 0.1);
+                
+                if (i === 0) {
+                  ctx.moveTo(x, y);
+                } else {
+                  ctx.lineTo(x, y);
+                }
+              }
+              
+              ctx.stroke();
+            }
+          }
+        }
         
         // Always collect samples, but mark acquisition phase
         const samples = bioSamplesRef.current;
@@ -1459,32 +1741,436 @@ export default function Home() {
     audio.volume = v;
   }, []);
 
-  const togglePortal = useCallback(async () => {
-    if (portalActive) {
-      const audio = portalAudioRef.current;
-      if (audio) {
-        const { ctx, oscFrequency, oscBass40, oscBass80, oscBass120, gainFrequency, gainBass } = audio;
-        gainFrequency.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
-        gainBass.gain.setTargetAtTime(0, ctx.currentTime, 0.15);
-        window.setTimeout(() => {
-          try {
-            oscFrequency.stop();
-            oscBass40.stop();
-            oscBass80.stop();
-            oscBass120.stop();
-          } catch {
-            // already stopped
-          }
-          ctx.close();
-          portalAudioRef.current = null;
-        }, 220);
+  const computeWatchResonance = useCallback((avgHrBpm: number | null, sleepScore0to100: number | null) => {
+    if (avgHrBpm == null && sleepScore0to100 == null) return null;
+    const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+
+    // If we only have HR, map HR directly to the requested bands.
+    if (avgHrBpm != null && sleepScore0to100 == null) {
+      if (avgHrBpm >= 90) return 45;
+      if (avgHrBpm <= 70) return 90;
+      // 70..90 bpm => 90..45
+      const t = clamp01((avgHrBpm - 70) / 20);
+      return 90 - t * 45;
+    }
+
+    // If we only have sleep, map sleep directly.
+    if (avgHrBpm == null && sleepScore0to100 != null) {
+      if (sleepScore0to100 <= 50) return 45;
+      if (sleepScore0to100 >= 85) return 90;
+      const t = clamp01((sleepScore0to100 - 50) / 35);
+      return 45 + t * 45;
+    }
+
+    // Combined: Sleep weighted more, HR stabilizes.
+    const sleepNorm = clamp01((sleepScore0to100 ?? 0) / 100);
+    const hrNorm = 1 - clamp01(((avgHrBpm ?? 95) - 55) / (95 - 55));
+    let score = 100 * (0.6 * sleepNorm + 0.4 * hrNorm);
+
+    const clearlyHigh = (sleepScore0to100 ?? 0) >= 85 && (avgHrBpm ?? 999) <= 70;
+    const clearlyLow = (sleepScore0to100 ?? 100) <= 50 || (avgHrBpm ?? 0) >= 90;
+    if (clearlyHigh) score = Math.max(score, 85);
+    if (clearlyLow) score = Math.min(score, 50);
+
+    return Math.max(0, Math.min(100, score));
+  }, []);
+
+  const detectPlatform = useCallback((): "ios" | "android" | "other" => {
+    if (typeof navigator === "undefined") return "other";
+    const ua = navigator.userAgent.toLowerCase();
+    if (/iphone|ipad|ipod/.test(ua)) return "ios";
+    if (/android/.test(ua)) return "android";
+    return "other";
+  }, []);
+
+  const saveWatchData = useCallback((next: {
+    source: "dafit" | "googlefit" | "healthkit" | "manual";
+    avgHeartRate: number | null;
+    sleepScore: number | null;
+    sleepHours?: number | null;
+  }) => {
+    const resonance = computeWatchResonance(next.avgHeartRate, next.sleepScore);
+    setWatchAvgHeartRate(next.avgHeartRate);
+    setWatchSleepScore(next.sleepScore);
+    setWatchSleepHours(next.sleepHours ?? null);
+    setWatchResonance(resonance);
+    setWatchSyncSource(next.source);
+    setWatchSyncStatus(resonance != null ? "connected" : "disconnected");
+    setWatchSyncError(null);
+
+    // Bio-Score Integration (requested): HR thresholds map to Low/High resonance.
+    if (next.avgHeartRate != null) {
+      if (next.avgHeartRate > 85) {
+        setWatchResonanceBand("Low");
+        setWatchResonance(45);
+      } else if (next.avgHeartRate < 65) {
+        setWatchResonanceBand("High");
+        setWatchResonance(90);
+      } else {
+        setWatchResonanceBand("Balanced");
+        setWatchResonance(resonance);
       }
-      const bgAudio = backgroundHumAudioRef.current;
-      if (bgAudio) {
+    } else {
+      setWatchResonanceBand(null);
+    }
+
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(
+        "highvibe_watch_sync",
+        JSON.stringify({
+          source: next.source,
+          avgHeartRate: next.avgHeartRate,
+          sleepScore: next.sleepScore,
+          sleepHours: next.sleepHours ?? null,
+          resonance,
+          resonanceBand:
+            next.avgHeartRate != null
+              ? next.avgHeartRate > 85
+                ? "Low"
+                : next.avgHeartRate < 65
+                  ? "High"
+                  : "Balanced"
+              : null,
+          syncedAt: new Date().toISOString()
+        })
+      );
+    }
+  }, [computeWatchResonance]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem("highvibe_watch_sync");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as {
+        source?: "dafit" | "googlefit" | "healthkit" | "manual";
+        avgHeartRate?: number | null;
+        sleepScore?: number | null;
+        sleepHours?: number | null;
+        resonance?: number | null;
+        resonanceBand?: "Low" | "High" | "Balanced" | null;
+      };
+      const resonance = computeWatchResonance(parsed.avgHeartRate ?? null, parsed.sleepScore ?? null);
+      setWatchAvgHeartRate(parsed.avgHeartRate ?? null);
+      setWatchSleepScore(parsed.sleepScore ?? null);
+      setWatchSleepHours(parsed.sleepHours ?? null);
+      setWatchResonance(resonance);
+      setWatchResonanceBand(parsed.resonanceBand ?? null);
+      setWatchSyncSource(parsed.source ?? null);
+      setWatchSyncStatus(resonance != null ? "connected" : "disconnected");
+    } catch {
+      // ignore
+    }
+  }, [computeWatchResonance]);
+
+  const requestFitnessPermission = useCallback(async () => {
+    // Note: There is no standardized "fitness" permission in the Web Permissions API.
+    // We keep this as a best-effort stub for future native/PWA bridges.
+    setWatchSyncError(null);
+    try {
+      if (!("permissions" in navigator) || typeof (navigator as any).permissions?.query !== "function") {
+        setWatchSyncError("This browser doesn’t support the Permissions API.");
+        return false;
+      }
+      setWatchSyncError("Browsers don’t expose a 'fitness' permission. Use the connection method below.");
+      return false;
+    } catch {
+      setWatchSyncError("Fitness permissions aren’t available in the browser. Use the connection method below.");
+      return false;
+    }
+  }, []);
+
+  const ensureGoogleIdentityScript = useCallback(async () => {
+    if (typeof window === "undefined") return false;
+    if (googleGisLoadedRef.current) return true;
+    if ((window as any).google?.accounts?.oauth2) {
+      googleGisLoadedRef.current = true;
+      return true;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
+      if (existing) {
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener("error", () => reject(new Error("Failed to load Google Identity script")), {
+          once: true
+        });
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Failed to load Google Identity script"));
+      document.head.appendChild(script);
+    });
+
+    googleGisLoadedRef.current = Boolean((window as any).google?.accounts?.oauth2);
+    return googleGisLoadedRef.current;
+  }, []);
+
+  const fetchGoogleFitAvgHeartRateLast24h = useCallback(async (accessToken: string) => {
+    const end = Date.now();
+    const start = end - 24 * 60 * 60 * 1000;
+
+    const res = await fetch("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        aggregateBy: [{ dataTypeName: "com.google.heart_rate.bpm" }],
+        bucketByTime: { durationMillis: 60 * 60 * 1000 },
+        startTimeMillis: start,
+        endTimeMillis: end
+      })
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Google Fit API error (${res.status}): ${text || res.statusText}`);
+    }
+
+    const json = (await res.json()) as any;
+    const buckets = Array.isArray(json?.bucket) ? json.bucket : [];
+    let sum = 0;
+    let count = 0;
+
+    for (const b of buckets) {
+      const datasets = b?.dataset;
+      const points = Array.isArray(datasets?.[0]?.point) ? datasets[0].point : [];
+      for (const p of points) {
+        const v = p?.value?.[0];
+        const fp = typeof v?.fpVal === "number" ? v.fpVal : typeof v?.intVal === "number" ? v.intVal : null;
+        if (fp != null && Number.isFinite(fp)) {
+          sum += fp;
+          count += 1;
+        }
+      }
+    }
+
+    if (count === 0) return null;
+    return sum / count;
+  }, []);
+
+  const fetchGoogleFitSleepHoursLast24h = useCallback(async (accessToken: string) => {
+    const end = Date.now();
+    const start = end - 24 * 60 * 60 * 1000;
+
+    const res = await fetch("https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        aggregateBy: [{ dataTypeName: "com.google.sleep.segment" }],
+        bucketByTime: { durationMillis: 24 * 60 * 60 * 1000 },
+        startTimeMillis: start,
+        endTimeMillis: end
+      })
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Google Fit Sleep API error (${res.status}): ${text || res.statusText}`);
+    }
+
+    const json = (await res.json()) as any;
+    const buckets = Array.isArray(json?.bucket) ? json.bucket : [];
+    let sleepMs = 0;
+
+    // Google Fit sleep segment stages (common mapping):
+    // 1=awake, 2=sleep, 3=out-of-bed, 4=light, 5=deep, 6=rem
+    const isSleepStage = (stage: number) => stage === 2 || stage === 4 || stage === 5 || stage === 6;
+
+    for (const b of buckets) {
+      const datasets = b?.dataset;
+      const points = Array.isArray(datasets?.[0]?.point) ? datasets[0].point : [];
+      for (const p of points) {
+        const stage = p?.value?.[0]?.intVal;
+        const startN = Number(p?.startTimeNanos);
+        const endN = Number(p?.endTimeNanos);
+        if (!Number.isFinite(stage) || !Number.isFinite(startN) || !Number.isFinite(endN)) continue;
+        if (!isSleepStage(stage)) continue;
+        const durMs = Math.max(0, (endN - startN) / 1e6);
+        sleepMs += durMs;
+      }
+    }
+
+    if (sleepMs <= 0) return null;
+    return sleepMs / (1000 * 60 * 60);
+  }, []);
+
+  const syncFromWatchGoogleFit = useCallback(async () => {
+    setWatchSyncError(null);
+    setWatchIntegratedMsg(null);
+    setWatchSyncing(true);
+    setWatchSyncingStep("Opening secure Google authorization…");
+
+    const clientId = GOOGLE_FIT_CLIENT_ID;
+    if (!clientId || clientId.includes("PASTE YOUR CLIENT ID HERE")) {
+      setWatchSyncError("Please paste your real Google OAuth Client ID into GOOGLE_FIT_CLIENT_ID in app/page.tsx.");
+      setWatchSyncing(false);
+      setWatchSyncingStep(null);
+      return;
+    }
+
+    const ok = await ensureGoogleIdentityScript();
+    if (!ok) {
+      setWatchSyncError("Could not load Google Identity Services. Check your connection.");
+      setWatchSyncing(false);
+      setWatchSyncingStep(null);
+      return;
+    }
+
+    const google = (window as any).google;
+    if (!google?.accounts?.oauth2?.initTokenClient) {
+      setWatchSyncError("Google Identity Services unavailable in this browser.");
+      setWatchSyncing(false);
+      setWatchSyncingStep(null);
+      return;
+    }
+
+    const tokenClient =
+      googleTokenClientRef.current ??
+      google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: [
+          "https://www.googleapis.com/auth/fitness.heart_rate.read",
+          "https://www.googleapis.com/auth/fitness.sleep.read"
+        ].join(" "),
+        callback: async (tokenResponse: any) => {
+          try {
+            if (tokenResponse?.error) {
+              throw new Error(tokenResponse.error_description || tokenResponse.error || "Authorization cancelled.");
+            }
+            const token = tokenResponse?.access_token;
+            if (!token) throw new Error("No access token returned.");
+
+            setWatchSyncingStep("Pulling your last 24h heart rate + sleep…");
+            const avgHr = await fetchGoogleFitAvgHeartRateLast24h(token);
+            if (avgHr == null) {
+              setWatchSyncError("No heart rate data found in the last 24 hours.");
+              setWatchSyncing(false);
+              setWatchSyncingStep(null);
+              return;
+            }
+
+            const sleepHours = await fetchGoogleFitSleepHoursLast24h(token).catch(() => null);
+
+            saveWatchData({
+              source: "googlefit",
+              avgHeartRate: avgHr,
+              sleepScore: watchSleepScore ?? null,
+              sleepHours
+            });
+
+            setWatchIntegratedMsg(
+              "Watch Data Integrated. Resonance updated based on your circadian rhythm."
+            );
+            setWatchSyncing(false);
+            setWatchSyncingStep(null);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : "Failed to sync Google Fit data.";
+            setWatchSyncError(msg);
+            setWatchSyncing(false);
+            setWatchSyncingStep(null);
+          }
+        }
+      });
+
+    googleTokenClientRef.current = tokenClient;
+    try {
+      setWatchSyncingStep("Waiting for your consent…");
+      tokenClient.requestAccessToken({ prompt: "consent" });
+    } catch {
+      setWatchSyncError("Google sign-in failed. Try again.");
+      setWatchSyncing(false);
+      setWatchSyncingStep(null);
+    }
+  }, [GOOGLE_FIT_CLIENT_ID, ensureGoogleIdentityScript, fetchGoogleFitAvgHeartRateLast24h, fetchGoogleFitSleepHoursLast24h, saveWatchData, watchSleepScore]);
+
+  const stopPortalAudioOnly = useCallback(async () => {
+    // Stop Instant Elevation audio without touching binaural engine.
+    const audio = portalAudioRef.current;
+    if (audio) {
+      const { ctx, oscFrequency, oscBass40, oscBass80, oscBass120, gainFrequency, gainBass } = audio;
+      try {
+        gainFrequency.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+        gainBass.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+      } catch {
+        // ignore
+      }
+
+      const safeStopDisconnect = (node: AudioScheduledSourceNode | AudioNode) => {
+        try {
+          if ("stop" in node && typeof (node as any).stop === "function") {
+            (node as any).stop();
+          }
+        } catch {
+          // already stopped
+        }
+        try {
+          (node as any).disconnect?.();
+        } catch {
+          // ignore
+        }
+      };
+
+      safeStopDisconnect(oscFrequency);
+      safeStopDisconnect(oscBass40);
+      safeStopDisconnect(oscBass80);
+      safeStopDisconnect(oscBass120);
+      safeStopDisconnect(gainFrequency);
+      safeStopDisconnect(gainBass);
+
+      try {
+        if (typeof ctx.suspend === "function") {
+          await ctx.suspend();
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        await ctx.close();
+      } catch {
+        // ignore
+      }
+
+      portalAudioRef.current = null;
+    }
+
+    const bgAudio = backgroundHumAudioRef.current;
+    if (bgAudio) {
+      try {
         bgAudio.pause();
         bgAudio.currentTime = 0;
+      } catch {
+        // ignore
       }
-      setPortalActive(false);
+    }
+
+    setPortalActive(false);
+  }, []);
+
+  const masterStopAllAudio = useCallback(async () => {
+    // Global stop: kill all oscillators and reset UI state.
+    await Promise.allSettled([hardStop(), stopPortalAudioOnly()]);
+
+    // Reset session/timer UI
+    setIsTimerRunning(false);
+    setTimerEndTs(null);
+    setTimerRemainingMs(null);
+    setHasTimerCompleted(false);
+    setShowCompletionBloom(false);
+  }, [hardStop, stopPortalAudioOnly]);
+
+  const togglePortal = useCallback(async () => {
+    if (portalActive) {
+      await stopPortalAudioOnly();
     } else {
       const audio = await ensurePortalAudio();
       if (audio) {
@@ -1507,7 +2193,7 @@ export default function Home() {
         setPortalActive(true);
       }
     }
-  }, [portalActive, ensurePortalAudio, updatePortalGains, updateAtmosphereVolume, portalVolumeFrequency, portalVolumeBass, portalVolumeAtmosphere]);
+  }, [portalActive, ensurePortalAudio, updatePortalGains, updateAtmosphereVolume, portalVolumeFrequency, portalVolumeBass, portalVolumeAtmosphere, stopPortalAudioOnly]);
 
   useEffect(() => {
     const visualRate = beatFrequency ? Math.max(0.6, 8 / beatFrequency) : 4;
@@ -1667,6 +2353,10 @@ export default function Home() {
 
   const handlePlayToggle = async () => {
     if (!isPlaying) {
+      // Starting binaural preset should stop Instant Elevation tones.
+      if (portalActive) {
+        await stopPortalAudioOnly();
+      }
       // Starting a session
       if (timerMinutes > 0) {
         const end = Date.now() + timerMinutes * 60 * 1000;
@@ -2223,9 +2913,13 @@ export default function Home() {
             <button
               type="button"
               onClick={() => {
+                if (portalActive) {
+                  void masterStopAllAudio();
+                  return;
+                }
                 setHasSessionContext(true);
                 void runAwakeningSweep();
-                togglePortal();
+                void togglePortal();
               }}
               className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
                 portalActive
@@ -2240,7 +2934,7 @@ export default function Home() {
               <span className={`h-2 w-2 rounded-full shadow-[0_0_10px_rgba(74,222,128,0.9)] ${
                 portalFrequency === 285 ? "bg-emerald-400" : "bg-purple-400"
               }`} />
-              7-Second Awakening Sweep
+              {portalActive ? "Stop Elevation" : "7-Second Awakening Sweep"}
             </button>
           </div>
 
@@ -2383,7 +3077,22 @@ export default function Home() {
                 className="flex flex-col gap-8"
               >
         {/* Bio-Scan – HRV & Stress */}
-        <section className="rounded-2xl border border-cyan-400/30 bg-cyan-950/10 p-4 sm:p-5">
+        <section className="relative rounded-2xl border border-cyan-400/30 bg-cyan-950/10 p-4 sm:p-5">
+          {/* Watch Connected Icon */}
+          <div className="absolute right-4 top-4">
+            <div
+              className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-[0.6rem] uppercase tracking-[0.18em] ${
+                watchSyncStatus === "connected"
+                  ? "border-emerald-400/60 bg-emerald-500/10 text-emerald-100 shadow-[0_0_18px_rgba(34,197,94,0.55)]"
+                  : "border-slate-500/30 bg-black/30 text-slate-300/70"
+              }`}
+              title={watchSyncStatus === "connected" ? "Watch Connected" : "Watch not synced"}
+            >
+              <Watch className="h-3.5 w-3.5" />
+              {watchSyncStatus === "connected" ? "Connected" : "Watch"}
+            </div>
+          </div>
+
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="space-y-2">
               <h2 className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200">
@@ -2404,6 +3113,46 @@ export default function Home() {
                 never stored or transmitted.
               </p>
             </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                // Primary path: Android/Chrome Google Fit via Google Identity Services.
+                void syncFromWatchGoogleFit();
+              }}
+              className="inline-flex items-center gap-2 self-start rounded-full border border-cyan-400/40 bg-cyan-500/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-100 shadow-[0_0_22px_rgba(34,211,238,0.45)] transition hover:bg-cyan-500/20"
+              title="Sync from watch (Google Fit)"
+            >
+              <motion.span
+                className="inline-flex"
+                animate={{
+                  filter: [
+                    "drop-shadow(0 0 6px rgba(34,211,238,0.35))",
+                    "drop-shadow(0 0 12px rgba(34,211,238,0.75))",
+                    "drop-shadow(0 0 6px rgba(34,211,238,0.35))"
+                  ]
+                }}
+                transition={{ duration: 2.2, repeat: Infinity, ease: "easeInOut" }}
+              >
+                <Watch className="h-4 w-4" />
+              </motion.span>
+              Sync Da Fit Watch
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setWatchIntegratedMsg(null);
+                setWatchSyncError(null);
+                setWatchSyncOpen(true);
+                void requestFitnessPermission();
+              }}
+              className="inline-flex items-center gap-2 self-start rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-200/80 transition hover:bg-white/10"
+              title="Enter Da Fit values manually"
+            >
+              <Link2 className="h-4 w-4" />
+              Manual Sync
+            </button>
           </div>
 
           {/* Mode Toggle */}
@@ -2589,6 +3338,26 @@ export default function Home() {
                   </span>
                 </motion.button>
               </div>
+              {/* Lock Confidence Bar for Finger Scan */}
+              {isBioScanning && bioScanMode === "finger" && (
+                <div className="flex flex-col items-center gap-2 w-full max-w-xs">
+                  <div className="flex items-center justify-between w-full">
+                    <span className="text-[0.65rem] text-cyan-100/70">Lock Confidence</span>
+                    <span className="text-[0.65rem] text-cyan-300/90 font-semibold">
+                      {bioLockConfidence.toFixed(0)}%
+                    </span>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800/80 border border-cyan-400/30">
+                    <motion.div
+                      className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-emerald-400 to-violet-400 shadow-[0_0_12px_rgba(34,211,238,0.8)]"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${bioLockConfidence}%` }}
+                      transition={{ duration: 0.3, ease: "easeOut" }}
+                    />
+                  </div>
+                </div>
+              )}
+              
               {/* Signal Strength Indicator */}
               {isBioScanning && (
                 <div className="flex flex-col items-center gap-2">
@@ -2650,6 +3419,21 @@ export default function Home() {
                   >
                     Vibration too high. Please keep steady for deep scan.
                   </motion.div>
+                )}
+                {bioScanMode === "finger" && bioPressureTooHigh && isBioScanning && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    className="mt-2 rounded-lg border border-amber-400/50 bg-amber-500/10 px-3 py-2 text-[0.65rem] text-amber-200/90"
+                  >
+                    Pressure too high—Press Lighter.
+                  </motion.div>
+                )}
+                {bioScanMode === "finger" && bioConsecutiveBeats > 0 && isBioScanning && (
+                  <div className="mt-2 text-[0.65rem] text-emerald-300/90">
+                    Beats detected: {bioConsecutiveBeats}/10
+                  </div>
                 )}
               </div>
               
@@ -2721,11 +3505,136 @@ export default function Home() {
                   muted
                   autoPlay
                 />
+                {/* Digital Fingerprint Animation for Finger Scan */}
+                {isBioScanning && bioScanMode === "finger" && bioFingerLocked && (
+                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+                    <motion.div
+                      className="relative"
+                      style={{
+                        width: "80px",
+                        height: "80px"
+                      }}
+                    >
+                      {/* Animated fingerprint pattern */}
+                      <svg
+                        viewBox="0 0 100 100"
+                        className="w-full h-full"
+                        style={{
+                          filter: `brightness(${0.7 + bioFingerprintPulse * 0.3}) drop-shadow(0 0 ${8 + bioFingerprintPulse * 12}px rgba(34,211,238,${0.6 + bioFingerprintPulse * 0.4}))`
+                        }}
+                      >
+                        {/* Fingerprint ridges pattern */}
+                        <defs>
+                          <pattern id="fingerprintPattern" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+                            <path
+                              d="M 0 10 Q 5 5 10 10 T 20 10"
+                              stroke="rgba(34,211,238,0.8)"
+                              strokeWidth="1.5"
+                              fill="none"
+                            />
+                            <path
+                              d="M 0 15 Q 5 12 10 15 T 20 15"
+                              stroke="rgba(34,211,238,0.6)"
+                              strokeWidth="1"
+                              fill="none"
+                            />
+                          </pattern>
+                        </defs>
+                        <circle cx="50" cy="50" r="45" fill="url(#fingerprintPattern)" opacity={0.3 + bioFingerprintPulse * 0.4} />
+                        {/* Concentric circles for fingerprint effect */}
+                        {[30, 35, 40].map((radius, idx) => (
+                          <circle
+                            key={idx}
+                            cx="50"
+                            cy="50"
+                            r={radius}
+                            fill="none"
+                            stroke="rgba(34,211,238,0.5)"
+                            strokeWidth="1"
+                            opacity={0.4 + bioFingerprintPulse * 0.3}
+                            strokeDasharray={`${Math.PI * radius / 8} ${Math.PI * radius / 8}`}
+                          />
+                        ))}
+                        {/* Center pulse circle */}
+                        <motion.circle
+                          cx="50"
+                          cy="50"
+                          r="15"
+                          fill="none"
+                          stroke="rgba(34,211,238,0.9)"
+                          strokeWidth="2"
+                          animate={{
+                            r: [15, 18 + bioFingerprintPulse * 3, 15],
+                            opacity: [0.6, 0.9 + bioFingerprintPulse * 0.1, 0.6]
+                          }}
+                          transition={{
+                            duration: 1.2,
+                            repeat: Infinity,
+                            ease: "easeInOut"
+                          }}
+                        />
+                      </svg>
+                    </motion.div>
+                  </div>
+                )}
               </div>
               <canvas ref={bioCanvasRef} className="hidden" />
+              {/* Pulse Waveform Canvas */}
+              {isBioScanning && bioScanMode === "finger" && (
+                <canvas
+                  ref={bioWaveformCanvasRef}
+                  className="h-24 w-full rounded-xl border border-cyan-400/30 bg-black/60"
+                  style={{ display: "block" }}
+                />
+              )}
             </div>
 
             <div className="space-y-3">
+              {/* Vibrational Resonance (Watch) */}
+              {watchResonance != null && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
+                    <span>Vibrational Resonance · Watch Signal</span>
+                    <span className="text-cyan-50">{watchResonance.toFixed(0)}%</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-slate-800/80">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-cyan-400 to-violet-400 shadow-[0_0_18px_rgba(34,211,238,0.8)]"
+                      style={{ width: `${Math.max(0, Math.min(100, watchResonance))}%` }}
+                    />
+                  </div>
+                  <div className="flex justify-between text-[0.65rem] text-cyan-100/70">
+                    <span>
+                      Avg HR: {watchAvgHeartRate != null ? `${watchAvgHeartRate.toFixed(0)} bpm` : "--"}
+                    </span>
+                    <span>
+                      Sleep: {watchSleepHours != null ? `${watchSleepHours.toFixed(1)} h` : "--"}
+                    </span>
+                  </div>
+                  {watchResonanceBand && (
+                    <div className="text-[0.65rem] text-cyan-100/80">
+                      Resonance:{" "}
+                      <span
+                        className={
+                          watchResonanceBand === "High"
+                            ? "text-emerald-300"
+                            : watchResonanceBand === "Low"
+                              ? "text-amber-300"
+                              : "text-cyan-200"
+                        }
+                      >
+                        {watchResonanceBand}
+                      </span>
+                    </div>
+                  )}
+                  {watchIntegratedMsg && (
+                    <div className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-[0.65rem] text-emerald-100/85">
+                      {watchIntegratedMsg}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
                   <span>The Ojoma Factor · Resilience Meter</span>
@@ -2753,49 +3662,51 @@ export default function Home() {
                 )}
               </div>
 
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
-                  <span>Pulse Waveform</span>
+              {bioScanMode === "face" && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[0.7rem] text-cyan-100/80">
+                    <span>Pulse Waveform</span>
+                  </div>
+                  <div className="h-24 overflow-hidden rounded-xl border border-cyan-400/30 bg-black/60 p-2 shadow-[0_0_28px_rgba(34,211,238,0.55)]">
+                    {bioWaveform.length > 0 ? (
+                      <svg viewBox="0 0 200 40" className="h-full w-full text-cyan-300/90" preserveAspectRatio="none">
+                        <defs>
+                          <linearGradient id="waveformGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                            <stop offset="0%" stopColor="rgba(34,211,238,0.3)" />
+                            <stop offset="100%" stopColor="rgba(34,211,238,0.9)" />
+                          </linearGradient>
+                          <filter id="glow">
+                            <feGaussianBlur stdDeviation="1" result="coloredBlur"/>
+                            <feMerge>
+                              <feMergeNode in="coloredBlur"/>
+                              <feMergeNode in="SourceGraphic"/>
+                            </feMerge>
+                          </filter>
+                        </defs>
+                        <polyline
+                          fill="none"
+                          stroke="url(#waveformGradient)"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          filter="url(#glow)"
+                          points={bioWaveform
+                            .map((v, i) => {
+                              const x = (i / Math.max(1, bioWaveform.length - 1)) * 200;
+                              const y = 40 - v * 36 - 2;
+                              return `${x},${y}`;
+                            })
+                            .join(" ")}
+                        />
+                      </svg>
+                    ) : (
+                      <div className="flex h-full items-center justify-center text-[0.65rem] text-cyan-200/60">
+                        Waveform will appear during signal acquisition...
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div className="h-24 overflow-hidden rounded-xl border border-cyan-400/30 bg-black/60 p-2 shadow-[0_0_28px_rgba(34,211,238,0.55)]">
-                  {bioWaveform.length > 0 ? (
-                    <svg viewBox="0 0 200 40" className="h-full w-full text-cyan-300/90" preserveAspectRatio="none">
-                      <defs>
-                        <linearGradient id="waveformGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-                          <stop offset="0%" stopColor="rgba(34,211,238,0.3)" />
-                          <stop offset="100%" stopColor="rgba(34,211,238,0.9)" />
-                        </linearGradient>
-                        <filter id="glow">
-                          <feGaussianBlur stdDeviation="1" result="coloredBlur"/>
-                          <feMerge>
-                            <feMergeNode in="coloredBlur"/>
-                            <feMergeNode in="SourceGraphic"/>
-                          </feMerge>
-                        </filter>
-                      </defs>
-                      <polyline
-                        fill="none"
-                        stroke="url(#waveformGradient)"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        filter="url(#glow)"
-                        points={bioWaveform
-                          .map((v, i) => {
-                            const x = (i / Math.max(1, bioWaveform.length - 1)) * 200;
-                            const y = 40 - v * 36 - 2;
-                            return `${x},${y}`;
-                          })
-                          .join(" ")}
-                      />
-                    </svg>
-                  ) : (
-                    <div className="flex h-full items-center justify-center text-[0.65rem] text-cyan-200/60">
-                      Waveform will appear during signal acquisition...
-                    </div>
-                  )}
-                </div>
-              </div>
+              )}
 
               {bioCoherence != null && (
                 <div className="space-y-1.5 text-[0.7rem] text-cyan-100/85">
@@ -2836,6 +3747,216 @@ export default function Home() {
             </div>
           </div>
         </section>
+
+        {/* Watch Sync Modal */}
+        <AnimatePresence>
+          {watchSyncOpen && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+              onClick={() => setWatchSyncOpen(false)}
+            >
+              <motion.div
+                initial={{ opacity: 0, y: 10, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 10, scale: 0.98 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
+                className="w-full max-w-md rounded-2xl border border-cyan-400/30 bg-slate-950/90 p-4 shadow-[0_0_50px_rgba(34,211,238,0.25)]"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200">
+                      Sync Watch Data
+                    </h3>
+                    <p className="mt-1 text-[0.7rem] text-cyan-100/70">
+                      Web apps can’t directly read Apple HealthKit, and browsers don’t expose a “fitness” permission.
+                      Use the best available bridge below.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setWatchSyncOpen(false)}
+                    className="rounded-full border border-white/10 bg-white/5 p-2 text-slate-200/80 transition hover:bg-white/10"
+                    title="Close"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+
+                {watchSyncError && (
+                  <div className="mt-3 rounded-xl border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-[0.7rem] text-amber-100/90">
+                    {watchSyncError}
+                  </div>
+                )}
+
+                <div className="mt-4 space-y-3">
+                  {detectPlatform() === "ios" && (
+                    <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                      <div className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-slate-100">
+                        iOS · Apple Health
+                      </div>
+                      <p className="mt-1 text-[0.7rem] text-slate-200/70">
+                        HealthKit is native‑only. To use Apple Health data, HighVibe needs a native iOS companion (or a
+                        wrapper app) that reads HealthKit and passes values to this web UI.
+                      </p>
+                    </div>
+                  )}
+
+                  {detectPlatform() === "android" && (
+                    <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                      <div className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-slate-100">
+                        Android · Google Fit
+                      </div>
+                      <p className="mt-1 text-[0.7rem] text-slate-200/70">
+                        Uses Google Identity Services to request the heart-rate read scope, then pulls the last 24 hours
+                        of heart-rate samples + sleep segments from the Google Fit REST API.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void syncFromWatchGoogleFit()}
+                        className="mt-2 inline-flex items-center gap-2 rounded-full border border-cyan-400/40 bg-cyan-500/10 px-3 py-1.5 text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-cyan-100 transition hover:bg-cyan-500/20"
+                      >
+                        <Link2 className="h-4 w-4" />
+                        Sync Da Fit Watch (Google Fit)
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 p-3">
+                    <div className="text-[0.7rem] font-semibold uppercase tracking-[0.18em] text-emerald-100">
+                      Da Fit Sync · Manual Mapping
+                    </div>
+                    <p className="mt-1 text-[0.7rem] text-emerald-100/70">
+                      Da Fit doesn’t provide a public web API. Enter the latest values shown inside Da Fit.
+                    </p>
+
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-[0.65rem] text-emerald-100/80">Average Heart Rate (bpm)</span>
+                        <input
+                          inputMode="numeric"
+                          value={watchAvgHeartRate ?? ""}
+                          onChange={(e) => {
+                            const n = Number(e.target.value);
+                            setWatchAvgHeartRate(Number.isFinite(n) ? n : null);
+                          }}
+                          className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400/60"
+                          placeholder="e.g. 72"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[0.65rem] text-emerald-100/80">Sleep Score (0–100)</span>
+                        <input
+                          inputMode="numeric"
+                          value={watchSleepScore ?? ""}
+                          onChange={(e) => {
+                            const n = Number(e.target.value);
+                            setWatchSleepScore(Number.isFinite(n) ? n : null);
+                          }}
+                          className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400/60"
+                          placeholder="e.g. 84"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          saveWatchData({
+                            source: "dafit",
+                            avgHeartRate: watchAvgHeartRate,
+                            sleepScore: watchSleepScore
+                          });
+                          setWatchSyncOpen(false);
+                        }}
+                        className="inline-flex items-center justify-center rounded-full border border-emerald-400/60 bg-emerald-500/20 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-50 shadow-[0_0_20px_rgba(34,197,94,0.5)] transition hover:bg-emerald-500/30"
+                      >
+                        Save & Sync
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWatchAvgHeartRate(null);
+                          setWatchSleepScore(null);
+                          setWatchResonance(null);
+                          setWatchSyncStatus("disconnected");
+                          setWatchSyncSource(null);
+                          setWatchSyncError(null);
+                          if (typeof window !== "undefined") {
+                            window.localStorage.removeItem("highvibe_watch_sync");
+                          }
+                        }}
+                        className="inline-flex items-center justify-center rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-200/80 transition hover:bg-white/10"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* In-app Sync Overlay (keeps experience inside HighVibe) */}
+        <AnimatePresence>
+          {watchSyncing && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
+            >
+              <motion.div
+                initial={{ opacity: 0, y: 10, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 10, scale: 0.98 }}
+                transition={{ duration: 0.2, ease: "easeOut" }}
+                className="w-full max-w-sm rounded-2xl border border-cyan-400/30 bg-slate-950/90 p-4 text-center shadow-[0_0_60px_rgba(34,211,238,0.25)]"
+              >
+                <motion.div
+                  className="mx-auto flex h-14 w-14 items-center justify-center rounded-full border border-cyan-400/40 bg-cyan-500/10"
+                  animate={{
+                    boxShadow: [
+                      "0 0 18px rgba(34,211,238,0.25)",
+                      "0 0 40px rgba(34,211,238,0.65)",
+                      "0 0 18px rgba(34,211,238,0.25)"
+                    ],
+                    scale: [1, 1.04, 1]
+                  }}
+                  transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+                >
+                  <Watch className="h-6 w-6 text-cyan-200" />
+                </motion.div>
+                <div className="mt-3 text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200">
+                  Smartwatch Sync
+                </div>
+                <div className="mt-2 text-[0.75rem] text-cyan-100/80">
+                  {watchSyncingStep ?? "Syncing…"}
+                </div>
+                <div className="mt-3 text-[0.65rem] text-slate-200/70">
+                  Google will briefly show a secure consent panel. When you finish, HighVibe will pull your data and
+                  update Resonance automatically.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWatchSyncing(false);
+                    setWatchSyncingStep(null);
+                  }}
+                  className="mt-4 inline-flex items-center justify-center rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-200/80 transition hover:bg-white/10"
+                >
+                  Dismiss
+                </button>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
               </motion.div>
             )}

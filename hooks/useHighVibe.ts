@@ -452,6 +452,41 @@ export function useHighVibe() {
     [ensureEngine, isPlaying]
   );
 
+  const hardStop = useCallback(async () => {
+    // Immediate master stop: kill oscillators + suspend audio context.
+    try {
+      engineRef.current?.stop();
+      engineRef.current?.dispose();
+      engineRef.current = null;
+    } catch {
+      // Best-effort cleanup only.
+    }
+
+    // Stop silence anchor
+    if (silentAudioRef.current) {
+      try {
+        silentAudioRef.current.pause();
+        silentAudioRef.current.currentTime = 0;
+      } catch {
+        // ignore
+      }
+    }
+
+    // Suspend Tone's underlying AudioContext (helps guarantee no residual sound)
+    try {
+      const tone = toneRef.current as any;
+      const ctx = tone?.getContext ? tone.getContext() : tone?.context;
+      const raw = ctx?.rawContext ?? ctx?._context ?? null;
+      if (raw && typeof raw.suspend === "function") {
+        await raw.suspend();
+      }
+    } catch {
+      // ignore
+    }
+
+    setIsPlaying(false);
+  }, []);
+
   const runAwakeningSweep = useCallback(async () => {
     if (awakeningSweepRef.current) return;
 
@@ -551,6 +586,7 @@ export function useHighVibe() {
     togglePlay,
     setBreathIntensity,
     softLanding,
+    hardStop,
     runAwakeningSweep
   };
 }
